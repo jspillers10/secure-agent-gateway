@@ -1,0 +1,74 @@
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "secure-agent-gateway"
+version = "0.1.0"
+description = "A security-engineering vertical slice for delegated-identity, policy-enforced AI tool invocation."
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = { text = "MIT" }
+authors = [{ name = "Jake Spillers" }]
+
+dependencies = [
+    "fastapi==0.141.1",
+    "pydantic==2.13.4",
+    "PyJWT==2.13.0",
+    "cryptography==50.0.0",
+    "httpx==0.28.1",
+    "uvicorn[standard]==0.52.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.0",
+    "pytest-cov==7.1.0",
+    "ruff==0.16.4",
+    "mypy==2.3.1",
+    "bandit==1.9.4",
+    "pip-audit==2.10.1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gateway"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "integration: requires docker compose (OPA + gateway) running",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "S", "C4", "SIM"]
+ignore = ["S101"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101", "S105", "S106", "E501"]
+"scripts/*" = ["S105", "S106"]
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Header"]
+
+[tool.mypy]
+python_version = "3.11"
+mypy_path = "src"
+strict = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = "jwt.*"
+ignore_missing_imports = true
+
+[tool.bandit]
+exclude_dirs = [".venv", "tests"]

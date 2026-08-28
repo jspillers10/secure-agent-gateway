@@ -5,7 +5,9 @@
 This threat model covers the vertical slice implemented in this repo: the
 `POST /v1/tool-invocations` and `POST /v1/approvals` endpoints, delegated-
 identity verification, the fixed tool registry, OPA-based authorization,
-the approval store, and the audit trail. It does **not** cover an LLM,
+the approval store, signed execution protocol, Worker Launcher, disposable
+Docker Workers, development workload authentication, and audit trail. It does
+**not** cover an LLM,
 because there isn't one yet; see [Roadmap](../README.md#roadmap).
 
 ## Trust boundaries
@@ -16,13 +18,20 @@ flowchart TB
         Agent["AI agent / any HTTP caller"]
     end
 
-    subgraph Trusted["Trusted compute (this repo)"]
+    subgraph Trusted["Trusted control plane (this repo)"]
         Gateway["Gateway process<br/>(internal_net + edge_net)"]
-        OPA["OPA process<br/>(internal_net only, no published port,<br/>--authorization=basic)"]
+        OPA["OPA process<br/>(mTLS, internal-only)"]
+        Launcher["Worker Launcher<br/>(mTLS; only Docker socket holder)"]
     end
 
-    Agent -- "boundary 1: network + bearer token<br/>(127.0.0.1:8088 only)" --> Gateway
-    Gateway -- "boundary 2: internal_net, no auth<br/>beyond network placement + OPA's own<br/>read-only management-API policy" --> OPA
+    subgraph Contained["Per-invocation containment boundary"]
+        Worker["Disposable Worker<br/>(no network, socket, or host mounts)"]
+    end
+
+    Agent -- "boundary 1: bearer token<br/>(127.0.0.1:8088 only)" --> Gateway
+    Gateway -- "boundary 2: mTLS + SPIFFE-role authorization" --> OPA
+    Gateway -- "boundary 3: mTLS + signed grant" --> Launcher
+    Launcher -- "boundary 4: fixed Docker create API + one-use stdin" --> Worker
 ```
 
 - **Boundary 1 (Agent → Gateway):** the only boundary a real attacker
@@ -32,21 +41,18 @@ flowchart TB
   published port is bound to `127.0.0.1` only (see `docker-compose.yml`),
   so this boundary is only reachable from the host itself in the local
   demo topology, not from the network.
-- **Boundary 2 (Gateway → OPA):** unauthenticated beyond network
-  reachability: no mTLS, no token. Two things narrow this boundary
-  beyond "same Docker network," both verified empirically, not just
-  configured: OPA sits on a Docker `internal: true` network with no route
-  to the internet and no published port at all (see
-  [Docker network topology](architecture.md#docker-network-topology)),
-  and OPA's own HTTP API is locked to exactly the gateway's decision
-  query plus a liveness check via `--authorization=basic` and
-  `policy/system/authz.rego`: every administrative request (policy
-  upload/delete, data introspection) gets a `401`, confirmed against a
-  live server by `scripts/verify_opa_hardening.py`. What remains
-  unaddressed: any process that *does* reach `internal_net` (e.g. a
-  compromised gateway container) can still query OPA for a decision, and
-  the channel itself isn't encrypted or mutually authenticated; see
-  Known limitations.
+- **Boundary 2 (Gateway → OPA):** TLS encrypts the channel and both peers
+  authenticate with locally generated workload certificates. OPA authorizes
+  the exact Gateway SPIFFE URI before allowing its narrow decision query.
+  Missing and wrong-role certificates are rejected in live tests.
+- **Boundary 3 (Gateway → Launcher):** mTLS authenticates the transport and a
+  short-lived RSA-signed `ExecutionGrant` authenticates and binds the action.
+  The Launcher's closed API has no runtime-control fields.
+- **Boundary 4 (Launcher → Worker):** the Launcher alone has Docker authority.
+  It selects a registry artifact and immutable image ID, creates a fresh
+  hardened container, and sends one bounded record through stdin. The Worker
+  has no network, Docker SDK/socket, host mount, or persistent state and signs
+  its result with a per-run key.
 
 Everything inside "Trusted compute" is code and configuration this repo
 controls and can reason about statically. Nothing outside it is trusted,
@@ -61,6 +67,9 @@ OPA (OPA never reads those fields from gateway input at all; see
 | Asset | Why it matters |
 |---|---|
 | Delegated-identity signing key (private) | Compromise lets an attacker impersonate any agent/user pair with any scopes. Never present in the gateway process; only the public key is. |
+| Execution-grant workload key (private) | Compromise lets an attacker mint Launcher-accepted grants until key rotation or grant expiry. Present only in the Gateway. |
+| Development workload CA keys | Compromise permits impersonating an internal service in the local prototype. Generated locally, gitignored, and not production PKI. |
+| Launcher Docker authority | Compromise can create arbitrary containers and may amount to host compromise. Only the narrow Launcher has this authority. |
 | Approval records | Authorize a high-risk, otherwise-blocked action. Must be unforgeable and single-use. |
 | Audit trail | The only record of who did what. Must be complete and must not itself become a data leak. |
 | Mock tool "data" (fixed in-memory documents/tickets) | Low value by design: these are inert fixtures, not real systems. |
@@ -88,6 +97,8 @@ relevant, the test that exercises it.
 | Client names an arbitrary Python function/module as the "tool" | Tool names only ever index a fixed, hardcoded `dict` (`TOOL_REGISTRY`). No `getattr`, no `importlib`, no `eval`. `test_unknown_tool_rejected`. |
 | Client tampers with an approval's bound arguments (asks for approval on X, executes Y) | Approval records store a hash of the exact validated arguments; consumption re-hashes the current request's arguments and requires an exact match. `test_approval_for_different_arguments_denied`. |
 | Client reuses one identity's approval under another identity | Approval records are bound to `(agent_id, delegated_user_id)`; mismatch is rejected. `test_approval_for_different_identity_denied`. |
+| Grant or result fields are changed after authorization | Closed envelopes commit canonical arguments/actions/results; RSA signatures and exact invocation/tool/artifact/approval binding are rechecked at each boundary. `tests/test_execution_protocol.py`. |
+| Caller supplies an image, command, mount, capability, network, or host path | The Launcher's only request field is `grant`; all runtime configuration comes from its own registry and fixed create call. `tests/test_launcher.py::test_launcher_api_rejects_every_caller_runtime_control`. |
 
 ### Repudiation
 
@@ -127,12 +138,17 @@ beyond Pydantic field constraints). Noted under Known limitations.
 | Policy answers with malformed, incomplete, or unexpected-shaped data (missing field, unknown field, empty version, unknown decision string) | `PolicyDecision` is a closed Pydantic schema (`extra="forbid"`); any deviation raises `PolicyError`, treated identically to an outage: `503`, fail closed. |
 | Approval-creation endpoint is called by the requesting agent itself (self-approval) | `POST /v1/approvals` requires a separate `X-Approver-Key` credential, distinct from any agent's delegated-identity token. This is a simplification; see Known limitations. |
 | Client sets its own approver identity on a grant (`granted_by`) to fabricate provenance | The request schema has no `granted_by` field at all (`extra="forbid"` rejects one if sent); the approver identity recorded is always `Settings.approver_identity`, from trusted server configuration. `test_create_approval_ignores_client_supplied_granted_by`. |
+| A valid grant is replayed or raced concurrently | The Launcher atomically claims its signed nonce before container creation; one process has one winner. `test_one_grant_has_exactly_one_concurrent_winner`. |
+| A Worker reaches the network, host, Docker socket, or prior invocation state | Every invocation is a new `--network none`, non-root, read-only container with no mounts or socket, a bounded tmpfs, dropped capabilities, no-new-privileges, and quotas. `scripts/verify_worker_hardening.py` exercises live network and cross-run-state controls. |
 
 ## Security assumptions
 
-- **The gateway never holds a private signing key.** It only holds the
-  public key used to *verify* tokens; tokens are minted by an external,
+- **The Gateway never holds the delegated-identity issuer's private signing
+  key.** It only holds the public key used to *verify* tokens; tokens are minted by an external,
   trusted identity issuer not implemented in this repo.
+- **The Gateway does hold a dedicated development execution-grant private
+  key.** Compromise permits grants until that local key is rotated; the key is
+  never placed in the Worker or Launcher.
 - **`sub == agent_id` for every issued token.** The identity model treats
   these as the same value; an issuer minting tokens where they differ
   will have every such token rejected (`TokenSubjectMismatch`). See
@@ -180,12 +196,10 @@ Each is a candidate for the roadmap.
 - **No rate limiting or request-size ceiling beyond field-level
   constraints.** A malicious or buggy caller can send unbounded request
   volume; nothing in this slice throttles it.
-- **Gateway → OPA is not mutually authenticated or encrypted.** Relies on
-  network placement (the `internal_net` Docker network) plus OPA's own
-  `--authorization=basic` policy rather than transport-level identity
-  (mTLS) or TLS at all. Anything that reaches `internal_net` can query
-  OPA for a decision (though not mutate its policy; see
-  `policy/system/authz.rego`).
+- **Development workload identity is not production PKI.** Local CAs and
+  short-lived fixture certificates provide mTLS and role-negative tests, but
+  there is no automated enrollment, rotation, revocation, or hardware-backed
+  key protection.
 - **The gateway container is not network-egress-blocked.** It is
   attached to both `internal_net` and a normal bridge network
   (`edge_net`), the latter solely so its port can be published to the
@@ -206,9 +220,14 @@ Each is a candidate for the roadmap.
   honored for its full lifetime; there is no denylist or short-lived-token
   rotation strategy in this slice (tokens are expected to be short-lived
   by convention, not enforced by the gateway).
-- **No sandboxing of tool execution.** The mock tools are inert by
-  construction (no I/O), so this doesn't matter yet, but it will the
-  moment a real tool with actual side effects is registered. See Roadmap.
+- **Docker and Launcher remain high-value trust assumptions.** Docker shares
+  the host kernel and is not equivalent to gVisor or a microVM. The Launcher
+  has the Docker socket; its compromise can plausibly compromise the host.
+  Workers use Docker's default seccomp profile rather than a
+  Worker-specific minimized profile.
+- **Replay protection is process-local.** A Launcher restart forgets claimed
+  nonces. Short grant lifetimes reduce but do not eliminate the resulting
+  replay window; distributed durable nonce storage is not implemented.
 - **No defense against a compromised or malicious tool's *output*.** This
   slice only defends the invocation path; nothing here evaluates whether
   a tool's returned data is safe to hand back to an agent/LLM. See

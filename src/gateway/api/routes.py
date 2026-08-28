@@ -30,6 +30,8 @@ from pydantic import ValidationError
 
 from gateway.api.deps import (
     get_approval_store,
+    get_grant_signer,
+    get_launcher_client,
     get_policy_client,
     get_settings,
     get_verified_identity,
@@ -49,11 +51,13 @@ from gateway.audit.log import (
     emit_audit_event,
 )
 from gateway.config import Settings
+from gateway.execution.client import LauncherClient, LauncherError
+from gateway.execution.protocol import ActionEnvelope, ApprovalBinding, ToolIdentity
+from gateway.execution.signing import ExecutionGrantSigner
 from gateway.hashing import sha256_hex
 from gateway.identity.models import AgentIdentity
 from gateway.policy.client import PolicyClient, PolicyError
 from gateway.registry.tools import UnknownToolError, resolve_tool
-from gateway.tools_impl.errors import ToolExecutionError
 
 router = APIRouter()
 _log = logging.getLogger("gateway.api")
@@ -74,6 +78,8 @@ async def invoke_tool(
     identity: AgentIdentity = Depends(get_verified_identity),
     policy_client: PolicyClient = Depends(get_policy_client),
     approval_store: ApprovalStore = Depends(get_approval_store),
+    launcher_client: LauncherClient = Depends(get_launcher_client),
+    grant_signer: ExecutionGrantSigner = Depends(get_grant_signer),
 ) -> ToolInvocationResponse:
     request_id = str(uuid4())
     correlation_id = payload.correlation_id or request_id
@@ -423,35 +429,42 @@ async def invoke_tool(
         )
         audit_approval_state = "consumed"
 
+    approval_binding = ApprovalBinding(
+        required=decision.approval_required,
+        state="consumed" if decision.approval_required else "not_required",
+        digest=(
+            sha256_hex({"approval_capability": payload.approval_id})
+            if decision.approval_required
+            else None
+        ),
+    )
+    invocation_id = str(uuid4())
+    action = ActionEnvelope(
+        invocation_id=invocation_id,
+        request_id=request_id,
+        correlation_id=correlation_id,
+        agent_id=identity.agent_id,
+        delegated_user_id=identity.delegated_user.id,
+        tool=ToolIdentity(name=tool_spec.name, artifact_digest=tool_spec.artifact_digest),
+        arguments=validated_args.model_dump(mode="json"),
+        argument_digest=argument_hash,
+        approval=approval_binding,
+        policy_version=decision.policy_version,
+        risk=tool_spec.risk.value,
+        created_at=datetime.now(tz=UTC),
+    )
+    grant = grant_signer.issue(action)
+
     try:
-        result = tool_spec.handler(validated_args)
-    except ToolExecutionError as exc:
-        _log.warning("tool execution failed request_id=%s tool=%s", request_id, tool_spec.name)
-        emit_audit_event(
-            AuditEvent(
-                request_id=request_id,
-                correlation_id=correlation_id,
-                timestamp=now,
-                agent_id=identity.agent_id,
-                delegated_user_id=identity.delegated_user.id,
-                tool_name=tool_spec.name,
-                scope_decision=scope_decision,
-                policy_decision="allow",
-                policy_version=decision.policy_version,
-                risk_level=tool_spec.risk.value,
-                approval_state=audit_approval_state,
-                argument_hash=argument_hash,
-                result_hash=sha256_hex({"error": "tool_execution_failed"}),
-                outcome="error",
-                error_code="tool_execution_failed",
-            )
-        )
-        raise HTTPException(
-            status.HTTP_502_BAD_GATEWAY,
-            _error_body("tool_execution_failed", "the tool failed to execute", request_id),
-        ) from exc
-    except Exception as exc:  # noqa: BLE001 - last line of defence: a broken mock tool must fail safely
-        _log.exception("unexpected tool failure request_id=%s tool=%s", request_id, tool_spec.name)
+        worker_result = await launcher_client.execute(grant)
+        if (
+            worker_result.invocation_id != invocation_id
+            or worker_result.grant_nonce != grant.nonce
+            or worker_result.tool != action.tool
+        ):
+            raise LauncherError("result_binding_mismatch")
+    except LauncherError as exc:
+        _log.warning("isolated execution failed request_id=%s tool=%s", request_id, tool_spec.name)
         emit_audit_event(
             AuditEvent(
                 request_id=request_id,
@@ -476,7 +489,33 @@ async def invoke_tool(
             _error_body("tool_execution_failed", "the tool failed to execute", request_id),
         ) from exc
 
-    result_hash = sha256_hex(result)
+    if worker_result.status == "failed" or worker_result.result is None:
+        emit_audit_event(
+            AuditEvent(
+                request_id=request_id,
+                correlation_id=correlation_id,
+                timestamp=now,
+                agent_id=identity.agent_id,
+                delegated_user_id=identity.delegated_user.id,
+                tool_name=tool_spec.name,
+                scope_decision=scope_decision,
+                policy_decision="allow",
+                policy_version=decision.policy_version,
+                risk_level=tool_spec.risk.value,
+                approval_state=audit_approval_state,
+                argument_hash=argument_hash,
+                result_hash=worker_result.result_digest,
+                outcome="error",
+                error_code="tool_execution_failed",
+            )
+        )
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            _error_body("tool_execution_failed", "the tool failed to execute", request_id),
+        )
+
+    result = worker_result.result
+    result_hash = worker_result.result_digest
     emit_audit_event(
         AuditEvent(
             request_id=request_id,

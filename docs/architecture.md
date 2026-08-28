@@ -12,11 +12,12 @@ flowchart LR
         Registry["Fixed tool registry<br/>+ per-tool Pydantic schemas<br/>(source of truth #1)"]
         Approvals["Approval store<br/>(validate, then atomic consume)"]
         CrossCheck["Registry ↔ policy<br/>metadata cross-check"]
-        Audit["Audit emitter<br/>(redacted, structured)"]
-        Mocks["Inert mock tools<br/>documents.read / tickets.create / admin.rotate_key"]
+        Audit["Gateway audit emitter<br/>(redacted, structured)"]
     end
 
     OPA["Open Policy Agent<br/>policy/gateway/authz.rego<br/>(source of truth #2:<br/>tool -> scope/risk/approval)"]
+    Launcher["Worker Launcher<br/>(only Docker API client/socket)"]
+    Worker["Fresh hardened Worker<br/>(three inert fixture tools)"]
 
     Agent -- "Bearer: delegated-identity JWT" --> API
     API --> Identity
@@ -25,7 +26,10 @@ flowchart LR
     Approvals -- "{agent_id, delegated_user_id,<br/>scopes, tool, approval_state}" --> OPA
     OPA -- "decision + metadata<br/>(required_scope, risk, approval_required)" --> CrossCheck
     CrossCheck -- "only if metadata matches registry" --> API
-    API -- "only on allow, after atomic consume" --> Mocks
+    API -- "signed, short-lived grant<br/>over mTLS" --> Launcher
+    Launcher -- "one request over stdin" --> Worker
+    Worker -- "per-run signed result" --> Launcher
+    Launcher -- "closed result over mTLS" --> API
     API --> Audit
 ```
 
@@ -36,7 +40,9 @@ flowchart LR
   `agent_id` (see [Identity model](#identity-model) below and
   `src/gateway/identity/tokens.py`).
 - **Fixed tool registry**: the only place a tool name resolves to a
-  handler. No dynamic import, no `getattr` on client input
+  schema, risk, scope, and artifact digest. A corresponding closed registry
+  inside the Worker resolves the inert handler. No dynamic import and no
+  `getattr` on client input
   (`src/gateway/registry/tools.py`). This is one of *two* independent
   sources of truth for what a tool costs; see
   [Who owns the policy mapping](#who-owns-the-policy-mapping) below.
@@ -56,13 +62,24 @@ flowchart LR
   metadata against its own registry entry for the same tool and fails
   closed on any mismatch, regardless of what `decision` says. See
   [Why a compromised gateway can't weaken policy](#why-a-compromised-gateway-cant-weaken-policy).
-- **Mock tools**: pure, inert functions. No shell, no network, no real
-  side effects (`src/gateway/tools_impl/`).
-- **Audit emitter**: two closed Pydantic schemas (`AuditEvent` for the
+- **Worker Launcher**: the only service with the Docker SDK and socket. Its
+  one-field request accepts an `ExecutionGrant`, not runtime options; its own
+  registry selects an image that is resolved once to an immutable Docker image
+  ID and a fixed entry point.
+- **Disposable Worker**: one non-root, read-only, network-disabled container
+  per accepted grant. It receives one bounded stdin record, re-verifies the
+  grant, executes one of the three inert fixtures, signs the result with a
+  per-run key, and exits. It has no Docker SDK or socket.
+- **Mock tools**: pure, inert functions executed only inside the Worker. No
+  shell, no network, no real side effects (`src/gateway/tools_impl/`).
+- **Audit emitters**: two closed Pydantic schemas (`AuditEvent` for the
   tool-invocation lifecycle, `ApprovalAuditEvent` for the approval
   lifecycle) that structurally cannot carry raw arguments, tokens,
   approval ids, or approver credentials; only hashes and enum-like
-  status fields (`src/gateway/audit/log.py`).
+  status fields (`src/gateway/audit/log.py`). Separate redacted Launcher and
+  Worker lifecycle schemas record accepted/start/terminal provenance without
+  arguments, credentials, grants, nonces, or raw results
+  (`src/gateway/execution/audit.py`).
 
 ## Identity model
 
@@ -107,7 +124,8 @@ sequenceDiagram
     participant Gateway
     participant Approvals as Approval Store
     participant OPA
-    participant Tool as Mock Tool
+    participant Launcher as Worker Launcher
+    participant Worker as Disposable Worker
 
     Agent->>Gateway: POST /v1/tool-invocations<br/>Authorization: Bearer <JWT><br/>{tool, arguments, approval_id?}
     Gateway->>Gateway: Verify signature, iss, aud, exp, sub==agent_id, claims<br/>(RS256-only allow-list, no alg confusion)
@@ -144,11 +162,17 @@ sequenceDiagram
         end
     end
     opt allow, and (no approval needed OR consume succeeded)
-        Gateway->>Tool: handler(validated_args)
-        alt handler raises
+        Gateway->>Gateway: Build ActionEnvelope and sign short-lived ExecutionGrant
+        Gateway->>Launcher: POST /v1/executions over mTLS<br/>{grant only; no runtime controls}
+        Launcher->>Launcher: Verify signature, claims, bindings, and nonce;<br/>atomically claim nonce
+        Launcher->>Worker: Create fresh hardened container by immutable image ID;<br/>deliver one bounded stdin record
+        Worker->>Worker: Re-verify grant and execute fixed-registry fixture
+        Worker-->>Launcher: Per-run signed ToolResultEnvelope
+        Launcher->>Launcher: Verify invocation/nonce/worker/tool/artifact binding; destroy Worker
+        alt Launcher, Worker, protocol, or cleanup fails
             Gateway-->>Agent: 502 tool_execution_failed (generic)
         end
-        Tool-->>Gateway: result
+        Launcher-->>Gateway: authenticated closed result
         Gateway-->>Agent: 200 {decision: "allow", result}
     end
     Gateway->>Gateway: Emit redacted audit event(s) (always, every branch)
@@ -162,7 +186,7 @@ decision in each case. HTTP error codes are reserved for requests the
 gateway could not evaluate at all or could not trust the answer to:
 `401` (bad token), `404` (unknown tool), `422` (schema validation
 failure, including a rejected client-supplied `risk` field), `502`
-(tool handler failure), `503` (policy engine unreachable, or the
+(isolated-execution failure), `503` (policy engine unreachable, or the
 policy's metadata disagreed with the registry).
 
 ## Two-phase approval flow
@@ -262,11 +286,14 @@ flowchart LR
 
     subgraph internal["internal_net (Docker internal: true,<br/>no route to the internet)"]
         Gateway
-        OPA["opa<br/>no published port"]
+        OPA["opa<br/>mTLS, no published port"]
+        Launcher["launcher<br/>mTLS, no published port<br/>only Docker socket holder"]
     end
 
     Host -- "127.0.0.1:8088" --> Gateway
-    Gateway -- "http://opa:8181" --> OPA
+    Gateway -- "https://opa:8181 (mTLS)" --> OPA
+    Gateway -- "https://launcher:8443 (mTLS + signed grant)" --> Launcher
+    Launcher -- "Docker API" --> Worker["fresh Worker<br/>no network attachment"]
 ```
 
 `internal_net` is a Docker Compose network with `internal: true`: Docker
@@ -274,7 +301,9 @@ gives it no route to the outside world, which was verified empirically
 (not assumed): a container attached only to it cannot resolve DNS or
 open any outbound connection (see `docs/threat-model.md`'s security
 assumptions for how this was checked). Both `gateway` and `opa` sit on
-it, and it's how they talk to each other.
+it, and it carries the mutually authenticated Gateway-to-OPA and
+Gateway-to-Launcher control channels. Disposable Workers are attached to no
+Docker network at all.
 
 `opa` is attached to **only** `internal_net` and has no published port at
 all. This was a deliberate choice after finding, empirically, that Docker
@@ -297,8 +326,9 @@ tradeoff made explicit, and why it's judged acceptable (the gateway's own
 code never constructs an outbound HTTP client except `OPAHttpPolicyClient`,
 targeting only the configured `OPA_URL`).
 
-OPA's own HTTP API is further locked down with `--authorization=basic`
-and `policy/system/authz.rego`, which allows only the gateway's decision
+OPA's own HTTPS API requires a client certificate signed by the development
+Gateway-client CA. Its `--authorization=basic` policy in
+`policy/system/authz.rego` checks the Gateway SPIFFE URI and allows only the decision
 query and a liveness check; every other request, including attempts to
 upload/replace/delete a policy via `PUT`/`DELETE /v1/policies/*` or to
 read `/v1/data`, gets a `401`. This was verified against a real running

@@ -14,9 +14,15 @@ def _base_env(tmp_public_key_path: str | None = None) -> dict[str, str]:
         "JWT_ISSUER": "https://issuer.test",
         "JWT_AUDIENCE": "secure-agent-gateway",
         "JWT_PUBLIC_KEY": "-----BEGIN PUBLIC KEY-----\nfake\n-----END PUBLIC KEY-----\n",
-        "OPA_URL": "http://opa:8181",
+        "OPA_URL": "https://opa:8181",
+        "LAUNCHER_URL": "https://launcher:8443",
         "APPROVER_API_KEY": "dev-only-key",
         "APPROVER_IDENTITY": "dev-only-approver",
+        "EXECUTION_GRANT_PRIVATE_KEY": "dev-only-private-key-fixture",
+        "EXECUTION_GRANT_PUBLIC_KEY": "dev-only-public-key-fixture",
+        "INTERNAL_CA_CERT_FILE": "internal-ca-cert.pem",
+        "GATEWAY_CLIENT_CERT_FILE": "gateway-client-cert.pem",
+        "GATEWAY_CLIENT_KEY_FILE": "gateway-client-key.pem",
     }
     if tmp_public_key_path:
         del env["JWT_PUBLIC_KEY"]
@@ -69,3 +75,11 @@ def test_load_settings_accepts_explicit_rs256() -> None:
     env["JWT_ALGORITHM"] = "RS256"
     settings = load_settings(env)
     assert settings.jwt_algorithm == "RS256"
+
+
+@pytest.mark.parametrize("endpoint", ["OPA_URL", "LAUNCHER_URL"])
+def test_internal_service_endpoint_must_use_https(endpoint: str) -> None:
+    env = _base_env()
+    env[endpoint] = "http://internal-service:8080"
+    with pytest.raises(ConfigurationError, match="must use https"):
+        load_settings(env)

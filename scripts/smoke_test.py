@@ -9,6 +9,7 @@ themselves.
 
 Usage:
     python scripts/generate_dev_keys.py
+    docker compose --profile worker-build build worker-image
     docker compose up -d --build
     python scripts/smoke_test.py
     docker compose down

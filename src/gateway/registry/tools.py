@@ -16,6 +16,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from gateway.hashing import sha256_hex
 from gateway.registry.schemas import AdminRotateKeyArgs, DocumentsReadArgs, TicketsCreateArgs
 from gateway.risk import RiskLevel
 from gateway.tools_impl.admin import admin_rotate_key
@@ -30,6 +31,7 @@ class UnknownToolError(Exception):
 @dataclass(frozen=True, slots=True)
 class ToolSpec:
     name: str
+    artifact_digest: str
     risk: RiskLevel
     required_scope: str
     approval_required: bool
@@ -37,9 +39,18 @@ class ToolSpec:
     handler: Callable[[BaseModel], dict[str, Any]]
 
 
+# The three inert fixtures ship as one versioned Worker bundle. The Launcher
+# resolves this logical artifact to a configured image and then creates the
+# container from Docker's immutable image ID, never from a caller-supplied tag.
+WORKER_ARTIFACT_DIGEST = sha256_hex(
+    {"bundle": "secure-agent-gateway-inert-tools", "protocol": "1.0", "version": 1}
+)
+
+
 TOOL_REGISTRY: Mapping[str, ToolSpec] = {
     "documents.read": ToolSpec(
         name="documents.read",
+        artifact_digest=WORKER_ARTIFACT_DIGEST,
         risk=RiskLevel.LOW,
         required_scope="documents.read",
         approval_required=False,
@@ -48,6 +59,7 @@ TOOL_REGISTRY: Mapping[str, ToolSpec] = {
     ),
     "tickets.create": ToolSpec(
         name="tickets.create",
+        artifact_digest=WORKER_ARTIFACT_DIGEST,
         risk=RiskLevel.MEDIUM,
         required_scope="tickets.write",
         approval_required=False,
@@ -56,6 +68,7 @@ TOOL_REGISTRY: Mapping[str, ToolSpec] = {
     ),
     "admin.rotate_key": ToolSpec(
         name="admin.rotate_key",
+        artifact_digest=WORKER_ARTIFACT_DIGEST,
         risk=RiskLevel.HIGH,
         required_scope="admin.rotate_key",
         approval_required=True,

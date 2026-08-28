@@ -39,10 +39,12 @@ every step:
 6. Cross-check OPA's answer against the gateway's own fixed tool registry
    and fail closed on any disagreement, regardless of the decision.
 7. Return `allow`, `deny`, or `approval-required`.
-8. Execute only an inert mock tool, only on `allow`, and only after
-   atomically re-confirming and consuming any required approval
-   immediately beforehand.
-9. Emit one or more **redacted, structured audit events** per request:
+8. Sign a short-lived, replay-resistant execution grant and send it over
+   mTLS to a narrow Worker Launcher. The Gateway never calls a handler.
+9. Let the Launcher select a registry-pinned image and fixed entry point,
+   create a fresh hardened Docker Worker, deliver one bounded stdin request,
+   verify its per-run signed result, and destroy it.
+10. Emit one or more **redacted, structured audit events** per request:
    hashes of arguments and results, never raw values, and never an
    approval id or credential.
 
@@ -61,7 +63,11 @@ flowchart LR
     end
     Validate -- "{agent_id, scopes, tool,<br/>approval_state}" --> OPA["Open Policy Agent<br/>(owns tool -> scope/risk/approval)"]
     OPA -- "decision + metadata" --> CrossCheck["Cross-check vs. registry"]
-    CrossCheck -- "only on allow +<br/>match + atomic consume" --> Tool["Inert mock tool"]
+    CrossCheck -- "only on allow +<br/>match + atomic consume" --> Grant["Signed execution grant"]
+    Grant -- "mTLS" --> Launcher["Worker Launcher<br/>(only Docker socket holder)"]
+    Launcher --> Worker["Fresh hardened Worker<br/>(no network)"]
+    Worker -- "per-run signed result" --> Launcher
+    Launcher --> Gateway
     Gateway --> Audit[("Redacted audit log")]
 ```
 
@@ -103,17 +109,20 @@ locally and run `opa test policy/ -v`.)
 
 ```bash
 python scripts/generate_dev_keys.py   # writes ./devkeys/, gitignored, never committed
+docker compose --profile worker-build build worker-image
 docker compose up -d --build
-python scripts/smoke_test.py          # end-to-end check against the real gateway + real OPA
+python scripts/smoke_test.py          # Gateway -> OPA -> Launcher -> fresh Workers
+python scripts/verify_worker_hardening.py
 docker compose down
 ```
 
 The gateway listens on `http://localhost:8088` (mapped from container port
 8000: 8000 is a common local dev port, so compose remaps it to avoid
 collisions; change the mapping in `docker-compose.yml` if you'd rather use
-8000). OPA has no published port at all; it's reachable only from the
-gateway container, over an isolated Docker network with no internet
-egress; see [docs/architecture.md#docker-network-topology](docs/architecture.md#docker-network-topology)
+8000). OPA and the Launcher have no published ports; the Gateway reaches them
+over mutually authenticated TLS on an isolated Docker network with no internet
+egress. Disposable Workers have no network attachment at all; see
+[docs/architecture.md#docker-network-topology](docs/architecture.md#docker-network-topology)
 for why, and `scripts/verify_opa_hardening.py` for how to still query it
 directly for debugging.
 
@@ -121,6 +130,7 @@ directly for debugging.
 
 ```bash
 python scripts/generate_dev_keys.py
+docker compose --profile worker-build build worker-image
 docker compose up -d --build
 
 TOKEN=$(python scripts/mint_demo_token.py --scope documents.read)
@@ -234,13 +244,17 @@ src/gateway/
   policy/       OPA HTTP client (fail-closed on any error or schema mismatch)
   approvals/    single-use approval record store (validate, then atomic consume)
   audit/        redacted structured audit events (tool invocations + approvals)
+  execution/    closed envelopes, canonical hashing, signing, Launcher client, audit
+  launcher/     narrow Docker execution service, registry, replay guard
+  worker/       one-shot isolated Worker protocol/runtime
+  workload/     development workload-certificate validation
   tools_impl/   inert mock tool handlers
   api/          FastAPI routes, dependencies, request/response schemas
 policy/gateway/  Rego authorization policy (owns tool -> scope/risk/approval) + opa test suite
 policy/system/   OPA's own read-only management-API policy + opa test suite
 tests/           pytest suite (unit + API-level)
-scripts/         dev-only key generation, token minting, smoke test, OPA hardening verification
-docs/            architecture, threat model
+scripts/         key generation, smoke/OPA/Worker checks, latency measurement
+docs/            architecture, threat model, research roadmap, Milestone-1 report
 ```
 
 ## Security assumptions and known limitations
@@ -249,26 +263,23 @@ Summarized in [docs/threat-model.md](docs/threat-model.md#security-assumptions)
 and [docs/threat-model.md](docs/threat-model.md#known-limitations). In short: the approval store
 is in-memory and single-process (not production-durable), the approver
 credential is a static placeholder (not a real approver identity system),
-there's no rate limiting, the gateway/OPA channel isn't mutually
-authenticated or encrypted, and the gateway container (unlike OPA) is not
-network-egress-blocked because its port needs to be published to the
-host. None of these affect the correctness of the controls this slice
-claims; they're scope boundaries for what a second slice would add.
+there's no rate limiting, workload certificates are development fixtures,
+replay state is process-local, the Gateway retains edge-network egress, and
+the Launcher/Docker host boundary remains a high-value trust assumption. See
+[the Milestone-1 implementation report](docs/milestone-1-implementation.md).
 
 ## Roadmap
 
 Beyond this vertical slice:
 
-- **Sandboxed workers**: execute real (non-mock) tools in an isolated
-  runtime (gVisor/Firecracker-class isolation or an out-of-process worker
-  with a locked-down syscall surface) rather than in-process.
+- **Stronger isolation comparison**: evaluate gVisor or a microVM against the
+  current disposable Docker boundary without changing the signed protocol.
 - **Untrusted tool output**: treat a tool's *return value* as
   attacker-influenced input once real, non-inert tools exist (e.g. a
   document-fetch tool returning content from an external source), with
   output scanning/sanitization before it reaches an agent or LLM.
-- **Workload identity**: replace the static approver credential and the
-  Gateway↔OPA network-trust assumption with SPIFFE/SPIRE-style workload
-  identity and mutual TLS.
+- **Production workload identity**: replace local development CAs with
+  automated enrollment, rotation, revocation, and protected workload keys.
 - **Adversarial evaluations**: a red-team harness that scripts prompt-
   injection-style and policy-bypass attempts against a live gateway (not
   just unit tests of individual controls) and tracks pass/fail over time.

@@ -20,6 +20,12 @@ from fastapi.responses import JSONResponse
 from gateway.api.routes import router
 from gateway.approvals.store import ApprovalStore
 from gateway.config import Settings, load_settings
+from gateway.execution.client import (
+    LauncherClient,
+    LauncherHttpClient,
+    create_mtls_client_context,
+)
+from gateway.execution.signing import ExecutionGrantSigner
 from gateway.policy.client import PolicyClient
 from gateway.policy.opa_client import OPAHttpPolicyClient
 
@@ -31,15 +37,42 @@ def create_app(
     settings: Settings | None = None,
     policy_client: PolicyClient | None = None,
     approval_store: ApprovalStore | None = None,
+    launcher_client: LauncherClient | None = None,
+    grant_signer: ExecutionGrantSigner | None = None,
 ) -> FastAPI:
     resolved_settings = settings or load_settings()
 
     app = FastAPI(title="Secure Agent Gateway", version="0.1.0")
     app.state.settings = resolved_settings
+    if policy_client is None or launcher_client is None:
+        mtls_context = create_mtls_client_context(
+            ca_file=resolved_settings.internal_ca_cert_file,
+            cert_file=resolved_settings.gateway_client_cert_file,
+            key_file=resolved_settings.gateway_client_key_file,
+        )
+    else:
+        mtls_context = None
     app.state.policy_client = policy_client or OPAHttpPolicyClient(
-        resolved_settings.opa_url, timeout=resolved_settings.policy_timeout_seconds
+        resolved_settings.opa_url,
+        timeout=resolved_settings.policy_timeout_seconds,
+        ssl_context=mtls_context if mtls_context is not None else True,
     )
     app.state.approval_store = approval_store or ApprovalStore()
+    app.state.launcher_client = launcher_client or LauncherHttpClient(
+        resolved_settings.launcher_url,
+        ssl_context=mtls_context if mtls_context is not None else create_mtls_client_context(
+            ca_file=resolved_settings.internal_ca_cert_file,
+            cert_file=resolved_settings.gateway_client_cert_file,
+            key_file=resolved_settings.gateway_client_key_file,
+        ),
+        timeout=resolved_settings.launcher_timeout_seconds,
+    )
+    app.state.grant_signer = grant_signer or ExecutionGrantSigner(
+        resolved_settings.execution_grant_private_key,
+        issuer=resolved_settings.execution_grant_issuer,
+        audience=resolved_settings.execution_grant_audience,
+        ttl_seconds=resolved_settings.execution_grant_ttl_seconds,
+    )
 
     app.include_router(router)
 

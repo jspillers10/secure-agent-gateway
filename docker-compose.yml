@@ -1,85 +1,99 @@
-# Local, fully offline demo stack. No external services, no real secrets.
-#
-# Before first run:
-#   python scripts/generate_dev_keys.py
-#
-# This writes an ephemeral RSA keypair to ./devkeys/ (gitignored, never
-# committed). The gateway container reads the public half to verify
-# delegated-identity tokens; scripts/mint_demo_token.py uses the private
-# half to mint tokens for curl testing.
-#
-# APPROVER_API_KEY and APPROVER_IDENTITY below are fixed, clearly-labeled
-# development placeholders standing in for a real approver identity
-# system: neither is a production secret, and both grant access only to
-# this local compose stack.
-#
-# Network topology (see docs/architecture.md for the full writeup and why
-# it looks like this): `internal_net` carries all gateway<->opa traffic
-# and is a Docker `internal: true` network: neither container can reach
-# the internet through it, verified in docs/threat-model.md. OPA is
-# attached *only* to internal_net: Docker Compose does not support
-# publishing a port on a service whose only network is internal (verified
-# empirically, not assumed), so making OPA internal-only means it gets no
-# host-published port at all: a stronger guarantee than "published but
-# loopback-only", at the cost of OPA not being directly reachable from the
-# host. The gateway is additionally attached to `edge_net` (a normal,
-# non-internal bridge) solely so its own port can be published to the
-# host loopback interface for manual curl testing and the smoke test;
-# that second network leg does mean the gateway container itself is not
-# network-level egress-blocked the way OPA is; see docs/threat-model.md
-# for that tradeoff spelled out explicitly.
+# Local research stack. Run scripts/generate_dev_keys.py first. All credentials
+# are ephemeral, development-only, and gitignored.
 services:
+  worker-image:
+    profiles: ["worker-build"]
+    image: secure-agent-gateway-worker:milestone1
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+
   opa:
     image: openpolicyagent/opa@sha256:2b1c4b231f6dfa6a2baea4af4109203b10cd4b65e836d72f03bfe5d8dfce7095 # 0.70.0
     command:
       - run
       - --server
-      - --addr=:8181
+      - --addr=https://0.0.0.0:8181
+      - --authentication=tls
       - --authorization=basic
+      - --tls-cert-file=/keys/opa-cert.pem
+      - --tls-private-key-file=/keys/opa-key.pem
+      - --tls-ca-cert-file=/keys/gateway-client-ca-cert.pem
       - /policy
     user: "1000:1000"
     read_only: true
-    tmpfs:
-      - /tmp
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-    networks:
-      - internal_net
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [internal_net]
     volumes:
       - ./policy:/policy:ro
+      - ./devkeys:/keys:ro
     healthcheck:
       test: ["CMD", "/opa", "eval", "-i", "/dev/null", "1"]
       interval: 5s
       timeout: 3s
       retries: 10
 
+  launcher:
+    build:
+      context: .
+      dockerfile: Dockerfile.launcher
+    depends_on:
+      opa:
+        condition: service_healthy
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [internal_net]
+    environment:
+      GRANT_PUBLIC_KEY_FILE: /keys/execution-grant-public.pem
+      GRANT_ISSUER: secure-agent-gateway
+      GRANT_AUDIENCE: secure-agent-worker-launcher
+      WORKER_IMAGE_REFERENCE: secure-agent-gateway-worker:milestone1
+      WORKER_EXECUTION_TIMEOUT_SECONDS: "5"
+      WORKER_OUTPUT_LIMIT_BYTES: "65536"
+      WORKER_MEMORY_LIMIT: 128m
+      WORKER_NANO_CPUS: "500000000"
+      WORKER_PIDS_LIMIT: "64"
+    volumes:
+      - ./devkeys:/keys:ro
+      # High-value prototype trust assumption: this is the only socket mount.
+      - /var/run/docker.sock:/var/run/docker.sock
+
   gateway:
     build: .
     depends_on:
       opa:
         condition: service_healthy
+      launcher:
+        condition: service_started
     user: "10001:10001"
     read_only: true
-    tmpfs:
-      - /tmp
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-    networks:
-      - internal_net
-      - edge_net
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [internal_net, edge_net]
     environment:
-      JWT_ISSUER: "https://issuer.secure-agent-gateway.local"
-      JWT_AUDIENCE: "secure-agent-gateway"
-      JWT_PUBLIC_KEY_FILE: "/keys/public.pem"
-      JWT_ALGORITHM: "RS256"
-      OPA_URL: "http://opa:8181"
-      APPROVER_API_KEY: "dev-only-approver-key-not-a-secret"
-      APPROVER_IDENTITY: "dev-local-approver"
+      JWT_ISSUER: https://issuer.secure-agent-gateway.local
+      JWT_AUDIENCE: secure-agent-gateway
+      JWT_PUBLIC_KEY_FILE: /keys/public.pem
+      JWT_ALGORITHM: RS256
+      OPA_URL: https://opa:8181
+      LAUNCHER_URL: https://launcher:8443
+      INTERNAL_CA_CERT_FILE: /keys/internal-server-ca-cert.pem
+      GATEWAY_CLIENT_CERT_FILE: /keys/gateway-client-cert.pem
+      GATEWAY_CLIENT_KEY_FILE: /keys/gateway-client-key.pem
+      EXECUTION_GRANT_PRIVATE_KEY_FILE: /keys/execution-grant-private.pem
+      EXECUTION_GRANT_PUBLIC_KEY_FILE: /keys/execution-grant-public.pem
+      EXECUTION_GRANT_ISSUER: secure-agent-gateway
+      EXECUTION_GRANT_AUDIENCE: secure-agent-worker-launcher
+      EXECUTION_GRANT_TTL_SECONDS: "30"
+      APPROVER_API_KEY: dev-only-approver-key-not-a-secret
+      APPROVER_IDENTITY: dev-local-approver
       POLICY_TIMEOUT_SECONDS: "2.0"
+      LAUNCHER_TIMEOUT_SECONDS: "10.0"
     volumes:
       - ./devkeys:/keys:ro
     ports:

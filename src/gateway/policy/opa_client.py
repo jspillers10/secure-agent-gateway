@@ -15,6 +15,7 @@ closed.
 
 from __future__ import annotations
 
+import ssl
 from collections.abc import Mapping
 
 import httpx
@@ -24,13 +25,23 @@ from gateway.policy.client import PolicyDecision, PolicyError
 
 
 class OPAHttpPolicyClient:
-    def __init__(self, base_url: str, *, timeout: float = 2.0) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        timeout: float = 2.0,
+        ssl_context: ssl.SSLContext | bool = True,
+    ) -> None:
         self._endpoint = f"{base_url.rstrip('/')}/v1/data/gateway/authz/result"
         self._timeout = timeout
+        self._ssl_context = ssl_context
 
     async def evaluate(self, policy_input: Mapping[str, object]) -> PolicyDecision:
         try:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
+            async with httpx.AsyncClient(
+                timeout=self._timeout,
+                verify=self._ssl_context,
+            ) as client:
                 response = await client.post(self._endpoint, json={"input": dict(policy_input)})
             response.raise_for_status()
             body = response.json()

@@ -15,6 +15,8 @@ from fastapi import Header, HTTPException, Request, status
 
 from gateway.approvals.store import ApprovalStore
 from gateway.config import Settings
+from gateway.execution.client import LauncherClient
+from gateway.execution.signing import ExecutionGrantSigner
 from gateway.identity.models import AgentIdentity
 from gateway.identity.tokens import TokenVerificationError, verify_delegated_token
 from gateway.policy.client import PolicyClient
@@ -35,6 +37,16 @@ def get_policy_client(request: Request) -> PolicyClient:
 def get_approval_store(request: Request) -> ApprovalStore:
     approval_store: ApprovalStore = request.app.state.approval_store
     return approval_store
+
+
+def get_launcher_client(request: Request) -> LauncherClient:
+    launcher_client: LauncherClient = request.app.state.launcher_client
+    return launcher_client
+
+
+def get_grant_signer(request: Request) -> ExecutionGrantSigner:
+    grant_signer: ExecutionGrantSigner = request.app.state.grant_signer
+    return grant_signer
 
 
 def _extract_bearer_token(authorization: str | None) -> str | None:

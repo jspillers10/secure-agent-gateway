@@ -25,11 +25,15 @@ not just by the Rego test suite or the Python FakePolicyClient mirror.
 
 from __future__ import annotations
 
+import ssl
 import sys
 
 import httpx
 
-OPA_URL = "http://opa:8181"
+OPA_URL = "https://opa:8181"
+CA_FILE = "/keys/internal-server-ca-cert.pem"
+CLIENT_CERT = "/keys/gateway-client-cert.pem"
+CLIENT_KEY = "/keys/gateway-client-key.pem"
 
 
 def main() -> int:
@@ -41,7 +45,13 @@ def main() -> int:
         if not condition:
             failures.append(name)
 
-    with httpx.Client(base_url=OPA_URL, timeout=10.0) as client:
+    tls_context = ssl.create_default_context(cafile=CA_FILE)
+    tls_context.load_cert_chain(certfile=CLIENT_CERT, keyfile=CLIENT_KEY)
+    with httpx.Client(
+        base_url=OPA_URL,
+        timeout=10.0,
+        verify=tls_context,
+    ) as client:
         health_resp = client.get("/health")
         check("OPA health check reachable", health_resp.status_code == 200, health_resp.text)
 

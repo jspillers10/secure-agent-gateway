@@ -69,17 +69,28 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Install project (pinned by pyproject.toml; needed for smoke_test.py's httpx/PyJWT/cryptography)
-        run: pip install -e .
+      - name: Install project and Docker evaluation client
+        run: pip install -e ".[launcher]"
+
+      - name: Configure non-root Compose identity
+        run: |
+          echo "HOST_RUNTIME_UID=$(id -u)" >> "$GITHUB_ENV"
+          echo "HOST_RUNTIME_GID=$(id -g)" >> "$GITHUB_ENV"
+          echo "DOCKER_SOCKET_GID=$(stat -c '%g' /var/run/docker.sock)" >> "$GITHUB_ENV"
 
       - name: Generate ephemeral dev keys (never committed)
         run: python scripts/generate_dev_keys.py
 
       - name: Build and start the stack
-        run: docker compose up -d --build
+        run: |
+          docker compose --profile worker-build build worker-image
+          docker compose up -d --build
 
       - name: Run end-to-end smoke test (host -> gateway)
         run: python scripts/smoke_test.py
+
+      - name: Verify live disposable Worker hardening and cleanup
+        run: python scripts/verify_worker_hardening.py
 
       - name: Run OPA hardening verification (inside internal_net -> opa)
         # internal_net has no egress, so a plain python image can't pip
@@ -87,10 +98,22 @@ jobs:
         # which already has httpx as a project dependency.
         run: |
           docker run --rm --network secure-agent-gateway_internal_net \
+            --user "$HOST_RUNTIME_UID:$HOST_RUNTIME_GID" \
             -v "$PWD/scripts:/scripts:ro" \
+            -v "$PWD/devkeys:/keys:ro" \
             --entrypoint python \
             secure-agent-gateway-gateway \
             /scripts/verify_opa_hardening.py
+
+      - name: Verify internal mTLS control and negative cases
+        run: |
+          docker run --rm --network secure-agent-gateway_internal_net \
+            --user "$HOST_RUNTIME_UID:$HOST_RUNTIME_GID" \
+            -v "$PWD/scripts:/scripts:ro" \
+            -v "$PWD/devkeys:/keys:ro" \
+            --entrypoint python \
+            secure-agent-gateway-gateway \
+            /scripts/verify_internal_mtls.py
 
       - name: Show gateway logs on failure
         if: failure()

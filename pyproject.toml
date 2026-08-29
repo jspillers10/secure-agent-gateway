@@ -21,7 +21,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+launcher = [
+    "docker==7.1.0",
+]
 dev = [
+    "docker==7.1.0",
     "pytest==9.1.1",
     "pytest-asyncio==1.4.0",
     "pytest-cov==7.1.0",
@@ -69,6 +73,10 @@ plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
 module = "jwt.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "docker.*"
 ignore_missing_imports = true
 
 [tool.bandit]

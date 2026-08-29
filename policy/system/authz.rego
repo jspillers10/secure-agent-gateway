@@ -20,8 +20,16 @@ import rego.v1
 
 default allow := false
 
+gateway_identity if {
+	uri := input.client_certificates[0].URIs[0]
+	uri.Scheme == "spiffe"
+	uri.Host == "secure-agent-gateway"
+	uri.Path == "/gateway"
+}
+
 # Liveness check used by the Docker healthcheck / operators.
 allow if {
+	gateway_identity
 	input.method == "GET"
 	input.path == ["health"]
 }
@@ -33,11 +41,13 @@ allow if {
 # since it is still read-only and reveals nothing an operator couldn't
 # already see in the policy source.
 allow if {
+	gateway_identity
 	input.method == "POST"
 	input.path == ["v1", "data", "gateway", "authz"]
 }
 
 allow if {
+	gateway_identity
 	input.method == "POST"
 	input.path == ["v1", "data", "gateway", "authz", "result"]
 }

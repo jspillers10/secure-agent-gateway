@@ -20,7 +20,7 @@ services:
       - --tls-private-key-file=/keys/opa-key.pem
       - --tls-ca-cert-file=/keys/gateway-client-ca-cert.pem
       - /policy
-    user: "1000:1000"
+    user: "${HOST_RUNTIME_UID:-1000}:${HOST_RUNTIME_GID:-1000}"
     read_only: true
     tmpfs: [/tmp]
     cap_drop: [ALL]
@@ -69,7 +69,7 @@ services:
         condition: service_healthy
       launcher:
         condition: service_started
-    user: "10001:10001"
+    user: "${HOST_RUNTIME_UID:-10001}:${HOST_RUNTIME_GID:-10001}"
     read_only: true
     tmpfs: [/tmp]
     cap_drop: [ALL]

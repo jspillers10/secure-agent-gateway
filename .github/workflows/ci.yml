@@ -72,6 +72,11 @@ jobs:
       - name: Install project and Docker evaluation client
         run: pip install -e ".[launcher]"
 
+      - name: Configure non-root Compose identity
+        run: |
+          echo "HOST_RUNTIME_UID=$(id -u)" >> "$GITHUB_ENV"
+          echo "HOST_RUNTIME_GID=$(id -g)" >> "$GITHUB_ENV"
+
       - name: Generate ephemeral dev keys (never committed)
         run: python scripts/generate_dev_keys.py
 
@@ -92,6 +97,7 @@ jobs:
         # which already has httpx as a project dependency.
         run: |
           docker run --rm --network secure-agent-gateway_internal_net \
+            --user "$HOST_RUNTIME_UID:$HOST_RUNTIME_GID" \
             -v "$PWD/scripts:/scripts:ro" \
             -v "$PWD/devkeys:/keys:ro" \
             --entrypoint python \
@@ -101,6 +107,7 @@ jobs:
       - name: Verify internal mTLS control and negative cases
         run: |
           docker run --rm --network secure-agent-gateway_internal_net \
+            --user "$HOST_RUNTIME_UID:$HOST_RUNTIME_GID" \
             -v "$PWD/scripts:/scripts:ro" \
             -v "$PWD/devkeys:/keys:ro" \
             --entrypoint python \

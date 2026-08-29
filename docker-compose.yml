@@ -42,6 +42,8 @@ services:
     depends_on:
       opa:
         condition: service_healthy
+    user: "${HOST_RUNTIME_UID:-0}:${HOST_RUNTIME_GID:-0}"
+    group_add: ["${DOCKER_SOCKET_GID:-0}"]
     read_only: true
     tmpfs: [/tmp]
     cap_drop: [ALL]

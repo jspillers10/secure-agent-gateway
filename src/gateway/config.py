@@ -11,6 +11,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+from gateway.egress.url_policy import DestinationPolicyError, canonicalize_https_url
+
 # RS256 is the only algorithm this gateway will ever verify tokens with.
 # It is intentionally not a free-form setting: SUPPORTED_JWT_ALGORITHMS is
 # a set of exactly one, and load_settings() rejects any other value
@@ -45,6 +47,13 @@ class Settings:
     internal_ca_cert_file: str
     gateway_client_cert_file: str
     gateway_client_key_file: str
+    web_fetch_allowed_origins: tuple[str, ...] = (
+        "https://example.com",
+        "https://www.example.com",
+    )
+    web_fetch_max_redirects: int = 3
+    web_fetch_max_response_bytes: int = 65_536
+    web_fetch_timeout_seconds: float = 5.0
 
 
 def _read_public_key(env: dict[str, str]) -> str:
@@ -108,6 +117,30 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
         if not source[endpoint_name].startswith("https://"):
             raise ConfigurationError(f"{endpoint_name} must use https://")
 
+    raw_origins = source.get(
+        "WEB_FETCH_ALLOWED_ORIGINS", "https://example.com,https://www.example.com"
+    )
+    origins: list[str] = []
+    try:
+        for raw_origin in raw_origins.split(","):
+            canonical = canonicalize_https_url(raw_origin.strip())
+            if canonical.value != f"{canonical.origin}/":
+                raise ConfigurationError("WEB_FETCH_ALLOWED_ORIGINS entries must be origins")
+            origins.append(canonical.origin)
+    except DestinationPolicyError as exc:
+        raise ConfigurationError(f"invalid WEB_FETCH_ALLOWED_ORIGINS: {exc.code}") from exc
+    if not origins or len(origins) > 16 or len(set(origins)) != len(origins):
+        raise ConfigurationError("WEB_FETCH_ALLOWED_ORIGINS must contain 1-16 unique origins")
+    max_redirects = int(source.get("WEB_FETCH_MAX_REDIRECTS", "3"))
+    max_response_bytes = int(source.get("WEB_FETCH_MAX_RESPONSE_BYTES", "65536"))
+    fetch_timeout = float(source.get("WEB_FETCH_TIMEOUT_SECONDS", "5.0"))
+    if not 0 <= max_redirects <= 5:
+        raise ConfigurationError("WEB_FETCH_MAX_REDIRECTS must be between 0 and 5")
+    if not 1024 <= max_response_bytes <= 1024 * 1024:
+        raise ConfigurationError("WEB_FETCH_MAX_RESPONSE_BYTES must be between 1 KiB and 1 MiB")
+    if not 0.1 <= fetch_timeout <= 30.0:
+        raise ConfigurationError("WEB_FETCH_TIMEOUT_SECONDS must be between 0.1 and 30")
+
     return Settings(
         issuer=source["JWT_ISSUER"],
         audience=source["JWT_AUDIENCE"],
@@ -137,4 +170,8 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
         internal_ca_cert_file=source["INTERNAL_CA_CERT_FILE"],
         gateway_client_cert_file=source["GATEWAY_CLIENT_CERT_FILE"],
         gateway_client_key_file=source["GATEWAY_CLIENT_KEY_FILE"],
+        web_fetch_allowed_origins=tuple(origins),
+        web_fetch_max_redirects=max_redirects,
+        web_fetch_max_response_bytes=max_response_bytes,
+        web_fetch_timeout_seconds=fetch_timeout,
     )

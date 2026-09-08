@@ -10,6 +10,22 @@ from pydantic import ValidationError
 from gateway.worker.runtime import WorkerProtocolError, WorkerRequest, execute_worker_request
 
 MAX_INPUT_BYTES = 64 * 1024
+SUPPORTED_WEB_RESPONSE_BYTES = 65_536
+MAX_JSON_STRING_EXPANSION = 6
+# Closed-schema maxima for all generated non-body strings, including the
+# canonical URL and fixed-size RSA-2048 signature. JSON keys, punctuation, and
+# bounded numeric fields occupy fewer than the separately reserved 4 KiB.
+MAX_RESULT_NON_BODY_CHARACTERS = 3_351
+MAX_RESULT_STRUCTURE_BYTES = 4_096
+CALCULATED_MAX_WEB_RESULT_BYTES = (
+    SUPPORTED_WEB_RESPONSE_BYTES * MAX_JSON_STRING_EXPANSION
+    + MAX_RESULT_NON_BODY_CHARACTERS * MAX_JSON_STRING_EXPANSION
+    + MAX_RESULT_STRUCTURE_BYTES
+)
+MAX_OUTPUT_BYTES = 512 * 1024
+
+if CALCULATED_MAX_WEB_RESULT_BYTES > MAX_OUTPUT_BYTES:
+    raise RuntimeError("worker output bound is smaller than the supported result envelope")
 
 
 def main() -> int:
@@ -27,7 +43,7 @@ def main() -> int:
         print("worker protocol rejected", file=sys.stderr)
         return 2
     encoded = result.model_dump_json().encode("utf-8")
-    if len(encoded) > 64 * 1024:
+    if len(encoded) > MAX_OUTPUT_BYTES:
         print("worker output limit exceeded", file=sys.stderr)
         return 3
     sys.stdout.buffer.write(encoded + b"\n")

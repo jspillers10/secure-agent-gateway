@@ -52,7 +52,7 @@ from gateway.audit.log import (
 )
 from gateway.config import Settings
 from gateway.execution.client import LauncherClient, LauncherError
-from gateway.execution.protocol import ActionEnvelope, ApprovalBinding, ToolIdentity
+from gateway.execution.protocol import ActionEnvelope, ApprovalBinding, EgressGrant, ToolIdentity
 from gateway.execution.signing import ExecutionGrantSigner
 from gateway.hashing import sha256_hex
 from gateway.identity.models import AgentIdentity
@@ -80,6 +80,7 @@ async def invoke_tool(
     approval_store: ApprovalStore = Depends(get_approval_store),
     launcher_client: LauncherClient = Depends(get_launcher_client),
     grant_signer: ExecutionGrantSigner = Depends(get_grant_signer),
+    settings: Settings = Depends(get_settings),
 ) -> ToolInvocationResponse:
     request_id = str(uuid4())
     correlation_id = payload.correlation_id or request_id
@@ -439,6 +440,10 @@ async def invoke_tool(
         ),
     )
     invocation_id = str(uuid4())
+    canonical_arguments = validated_args.model_dump(mode="json")
+    destination = (
+        str(canonical_arguments["url"]) if tool_spec.name == "web.fetch_text" else None
+    )
     action = ActionEnvelope(
         invocation_id=invocation_id,
         request_id=request_id,
@@ -446,14 +451,26 @@ async def invoke_tool(
         agent_id=identity.agent_id,
         delegated_user_id=identity.delegated_user.id,
         tool=ToolIdentity(name=tool_spec.name, artifact_digest=tool_spec.artifact_digest),
-        arguments=validated_args.model_dump(mode="json"),
+        arguments=canonical_arguments,
         argument_digest=argument_hash,
         approval=approval_binding,
         policy_version=decision.policy_version,
         risk=tool_spec.risk.value,
+        destination=destination,
         created_at=datetime.now(tz=UTC),
     )
-    grant = grant_signer.issue(action)
+    egress = (
+        EgressGrant(
+            initial_url=destination,
+            allowed_origins=settings.web_fetch_allowed_origins,
+            max_redirects=settings.web_fetch_max_redirects,
+            max_response_bytes=settings.web_fetch_max_response_bytes,
+            timeout_seconds=settings.web_fetch_timeout_seconds,
+        )
+        if destination is not None
+        else None
+    )
+    grant = grant_signer.issue(action, egress=egress)
 
     try:
         worker_result = await launcher_client.execute(grant)

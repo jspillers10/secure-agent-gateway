@@ -15,6 +15,7 @@ class LauncherToolSpec:
     artifact_digest: str
     image_reference: str
     entrypoint: tuple[str, ...]
+    requires_egress: bool
 
 
 def build_launcher_registry(worker_image_reference: str) -> Mapping[str, LauncherToolSpec]:
@@ -24,6 +25,7 @@ def build_launcher_registry(worker_image_reference: str) -> Mapping[str, Launche
             artifact_digest=tool.artifact_digest,
             image_reference=worker_image_reference,
             entrypoint=("python", "-m", "gateway.worker.main"),
+            requires_egress=tool.requires_egress,
         )
         for name, tool in TOOL_REGISTRY.items()
     }

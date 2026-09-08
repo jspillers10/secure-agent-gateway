@@ -20,6 +20,17 @@ test_allow_when_scope_present_no_approval_needed if {
 	authz.decision == "allow" with input as base_input
 }
 
+test_web_fetch_requires_its_exact_scope if {
+	authz.decision == "allow" with input as object.union(base_input, {
+		"tool": "web.fetch_text",
+		"scopes": ["web.fetch_text"],
+	})
+	authz.decision == "deny" with input as object.union(base_input, {
+		"tool": "web.fetch_text",
+		"scopes": ["documents.read"],
+	})
+}
+
 test_deny_on_scope_escalation_attempt if {
 	# Agent has only documents.read but requests tickets.create, which
 	# OPA's own `tools` mapping resolves to requiring tickets.write.

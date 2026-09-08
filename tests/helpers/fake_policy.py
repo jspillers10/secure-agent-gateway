@@ -29,6 +29,7 @@ TOOLS: dict[str, dict[str, Any]] = {
     "documents.read": {"required_scope": "documents.read", "risk": "low", "approval_required": False},
     "tickets.create": {"required_scope": "tickets.write", "risk": "medium", "approval_required": False},
     "admin.rotate_key": {"required_scope": "admin.rotate_key", "risk": "high", "approval_required": True},
+    "web.fetch_text": {"required_scope": "web.fetch_text", "risk": "low", "approval_required": False},
 }
 
 

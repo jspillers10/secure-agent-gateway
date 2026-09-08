@@ -3,18 +3,22 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import serialization
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
+from scripts.generate_dev_keys import _create_ca
 
 from gateway.execution.audit import LAUNCHER_AUDIT_LOGGER_NAME
 from gateway.execution.client import LauncherError, LauncherRequest
-from gateway.execution.protocol import ActionEnvelope, ApprovalBinding, ToolIdentity
+from gateway.execution.protocol import ActionEnvelope, ApprovalBinding, EgressGrant, ToolIdentity
 from gateway.execution.signing import ExecutionGrantSigner, sign_tool_result
 from gateway.hashing import sha256_hex
 from gateway.launcher.config import LauncherSettings
@@ -25,7 +29,8 @@ from tests.helpers.keys import generate_rsa_keypair
 
 
 def _grant(private_key: str, *, tool_name: str = "documents.read") -> object:
-    arguments = {"document_id": "doc-001"}
+    is_web = tool_name == "web.fetch_text"
+    arguments = {"url": "https://example.com/"} if is_web else {"document_id": "doc-001"}
     action = ActionEnvelope(
         invocation_id="invocation-launcher",
         request_id="request-launcher",
@@ -38,13 +43,21 @@ def _grant(private_key: str, *, tool_name: str = "documents.read") -> object:
         approval=ApprovalBinding(required=False, state="not_required"),
         policy_version="test-v1",
         risk="low",
+        destination="https://example.com/" if is_web else None,
         created_at=datetime.now(tz=UTC),
     )
     return ExecutionGrantSigner(
         private_key,
         issuer="secure-agent-gateway",
         audience="secure-agent-worker-launcher",
-    ).issue(action)
+    ).issue(
+        action,
+        egress=(
+            EgressGrant(initial_url="https://example.com/", allowed_origins=("https://example.com",))
+            if is_web
+            else None
+        ),
+    )
 
 
 class _Socket:
@@ -162,9 +175,24 @@ class _Docker:
         self.containers = _Containers(mode)
 
 
-def _launcher(*, mode: str = "success", artifact_digest: str = WORKER_ARTIFACT_DIGEST):
+def _launcher(
+    *,
+    mode: str = "success",
+    artifact_digest: str = WORKER_ARTIFACT_DIGEST,
+    with_egress_identity: bool = False,
+):
     private_key, public_key = generate_rsa_keypair()
     docker = _Docker(mode=mode, artifact_digest=artifact_digest)
+    worker_ca_private = ""
+    worker_ca_certificate = ""
+    if with_egress_identity:
+        ca_key, ca_certificate = _create_ca("launcher-test-worker-ca")
+        worker_ca_private = ca_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        ).decode()
+        worker_ca_certificate = ca_certificate.public_bytes(serialization.Encoding.PEM).decode()
     settings = LauncherSettings(
         grant_public_key_pem=public_key,
         grant_issuer="secure-agent-gateway",
@@ -175,6 +203,9 @@ def _launcher(*, mode: str = "success", artifact_digest: str = WORKER_ARTIFACT_D
         memory_limit="128m",
         nano_cpus=500_000_000,
         pids_limit=64,
+        egress_server_ca_pem="test-server-ca" if with_egress_identity else "",
+        worker_ca_private_key_pem=worker_ca_private,
+        worker_ca_certificate_pem=worker_ca_certificate,
     )
     return DockerExecutionLauncher(settings, docker_client=docker), docker, private_key
 
@@ -218,8 +249,43 @@ def test_launcher_owns_hardened_runtime_configuration_and_returns_fixture_result
     assert options["nano_cpus"] == 500_000_000
     assert options["pids_limit"] == 64
     assert options["tmpfs"] == {"/tmp": "rw,noexec,nosuid,nodev,size=16m"}  # noqa: S108
+    assert options["log_config"] == {
+        "type": "local",
+        "config": {"max-size": "1m", "max-file": "1", "compress": "false"},
+    }
     assert not ({"volumes", "mounts", "network", "privileged", "devices"} & options.keys())
     assert docker.containers.created[0].removed == (True, True)
+
+
+def test_web_worker_remains_network_disabled_and_receives_only_fixed_broker_socket() -> None:
+    launcher, docker, private_key = _launcher(with_egress_identity=True)
+    result = launcher.execute(_grant(private_key, tool_name="web.fetch_text"))  # type: ignore[arg-type]
+    assert result.status == "failed"  # the unit fake intentionally has no live Unix socket
+    options = docker.containers.calls[0]
+    assert options["network_disabled"] is True
+    assert options["volumes"] == {
+        "secure-agent-gateway_egress_socket": {
+            "bind": "/run/secure-agent-egress",
+            "mode": "ro",
+        }
+    }
+    assert options["group_add"] == ["20000"]
+    assert "network" not in options
+    request = WorkerRequest.model_validate_json(
+        docker.containers.created[0].attached._sock.payload.strip()
+    )
+    assert request.egress_socket_path == "/run/secure-agent-egress/broker.sock"
+    assert request.egress_client_certificate_pem is not None
+    certificate = x509.load_pem_x509_certificate(
+        request.egress_client_certificate_pem.encode("utf-8")
+    )
+    uris = certificate.extensions.get_extension_for_class(
+        x509.SubjectAlternativeName
+    ).value.get_values_for_type(x509.UniformResourceIdentifier)
+    assert uris == [
+        "spiffe://secure-agent-gateway/worker/"
+        f"{request.grant.action.invocation_id}/{request.worker_id}"
+    ]
 
 
 def test_each_accepted_invocation_has_one_launcher_terminal_event(
@@ -271,6 +337,53 @@ def test_compose_mounts_orchestration_socket_only_into_launcher() -> None:
     assert compose.count("/var/run/docker.sock:/var/run/docker.sock") == 1
     launcher_section = compose.split("  launcher:", 1)[1].split("  gateway:", 1)[0]
     assert "/var/run/docker.sock:/var/run/docker.sock" in launcher_section
+
+
+def test_compose_broker_is_not_a_worker_network_and_socket_is_narrowly_shared() -> None:
+    compose = (Path(__file__).parents[1] / "docker-compose.yml").read_text(encoding="utf-8")
+    broker_section = compose.split("\n  egress-broker:", 1)[1].split("\n  web-fixture:", 1)[0]
+    gateway_section = compose.split("\n  gateway:", 1)[1].split("\n  egress-broker:", 1)[0]
+    assert "networks: [fixture_net, protected_net]" in broker_section
+    assert "egress_socket:/run/secure-agent-egress" in broker_section
+    assert "/var/run/docker.sock" not in broker_section
+    assert "egress_socket:/run/secure-agent-egress" not in gateway_section
+    launcher_source = (
+        Path(__file__).parents[1] / "src/gateway/launcher/service.py"
+    ).read_text(encoding="utf-8")
+    assert "network_disabled=True" in launcher_source
+
+
+def test_compose_uses_explicit_per_service_credential_mounts() -> None:
+    compose = (Path(__file__).parents[1] / "docker-compose.yml").read_text(encoding="utf-8")
+    assert "./devkeys:/keys:ro" not in compose
+
+    sections: dict[str, str] = {}
+    for name in (
+            "opa",
+            "launcher",
+            "gateway",
+            "ingress",
+            "egress-broker",
+            "web-fixture",
+            "protected-fixture",
+    ):
+        match = re.search(
+            rf"(?ms)^  {re.escape(name)}:\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|^networks:)",
+            compose,
+        )
+        assert match is not None
+        sections[name] = match.group(1)
+    assert "execution-grant-private.pem" in sections["gateway"]
+    assert "worker-client-ca-private.pem" not in sections["gateway"]
+    assert "worker-client-ca-private.pem" in sections["launcher"]
+    assert "execution-grant-private.pem" not in sections["launcher"]
+    assert "-key.pem" not in sections["opa"].replace("opa-key.pem", "")
+    assert "execution-grant-private.pem" not in sections["egress-broker"]
+    assert "worker-client-ca-private.pem" not in sections["egress-broker"]
+    assert "execution-grant-private.pem" not in sections["web-fixture"]
+    assert "worker-client-ca-private.pem" not in sections["web-fixture"]
+    assert "execution-grant-private.pem" not in sections["protected-fixture"]
+    assert "/keys/" not in sections["ingress"]
 
 
 def test_launcher_failure_cannot_call_gateway_process_handler(

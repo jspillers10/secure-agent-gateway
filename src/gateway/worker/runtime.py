@@ -7,9 +7,12 @@ executes one fixed-registry inert handler, signs one result, and exits.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import cast
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
+from gateway.egress.client import UnixTlsEgressClient
+from gateway.egress.protocol import BrokerFetchRequest
 from gateway.execution.protocol import ExecutionGrant, ToolResultEnvelope
 from gateway.execution.signing import (
     GrantVerificationError,
@@ -33,9 +36,35 @@ class WorkerRequest(BaseModel):
     result_private_key_pem: str
     expected_issuer: str
     expected_audience: str
+    egress_socket_path: str | None = None
+    egress_server_hostname: str | None = None
+    egress_server_ca_pem: str | None = None
+    egress_client_certificate_pem: str | None = None
+    egress_client_private_key_pem: str | None = None
+
+    @model_validator(mode="after")
+    def validate_egress_material(self) -> WorkerRequest:
+        values = (
+            self.egress_socket_path,
+            self.egress_server_hostname,
+            self.egress_server_ca_pem,
+            self.egress_client_certificate_pem,
+            self.egress_client_private_key_pem,
+        )
+        if any(value is not None for value in values) and not all(value for value in values):
+            raise ValueError("egress connection material must be complete")
+        if self.grant.action.tool.name != "web.fetch_text" and any(
+            value is not None for value in values
+        ):
+            raise ValueError("non-egress tools cannot receive broker credentials")
+        return self
 
 
-def execute_worker_request(request: WorkerRequest) -> ToolResultEnvelope:
+def execute_worker_request(
+    request: WorkerRequest,
+    *,
+    egress_client: object | None = None,
+) -> ToolResultEnvelope:
     action = request.grant.action
     try:
         tool_spec = resolve_tool(action.tool.name)
@@ -70,7 +99,36 @@ def execute_worker_request(request: WorkerRequest) -> ToolResultEnvelope:
     error_code: str | None
     status: str
     try:
-        result = tool_spec.handler(validated_args)
+        if tool_spec.requires_egress:
+            client = egress_client or _create_egress_client(request)
+            fetch = getattr(client, "fetch", None)
+            if fetch is None:
+                raise WorkerProtocolError("egress_client_invalid")
+            broker_result = fetch(
+                BrokerFetchRequest(
+                    worker_id=request.worker_id,
+                    grant=request.grant,
+                )
+            )
+            result = {
+                "url": broker_result.final_url,
+                "content_type": broker_result.content_type,
+                "byte_count": broker_result.byte_count,
+                "text": broker_result.text,
+                "redirect_hops": sum(
+                    1 for decision in broker_result.decisions if decision.reason == "redirect"
+                ),
+                "egress_latency_ms": {
+                    "dns": sum(decision.dns_duration_ms for decision in broker_result.decisions),
+                    "broker": sum(
+                        decision.broker_duration_ms for decision in broker_result.decisions
+                    ),
+                },
+            }
+        else:
+            if tool_spec.handler is None:
+                raise WorkerProtocolError("tool_handler_missing")
+            result = tool_spec.handler(validated_args)
         status = "succeeded"
         error_code = None
         committed = result
@@ -95,3 +153,30 @@ def execute_worker_request(request: WorkerRequest) -> ToolResultEnvelope:
         "completed_at": completed_at.isoformat(),
     }
     return sign_tool_result(unsigned, request.result_private_key_pem)
+
+
+def _create_egress_client(request: WorkerRequest) -> UnixTlsEgressClient:
+    if not all(
+        (
+            request.egress_socket_path,
+            request.egress_server_hostname,
+            request.egress_server_ca_pem,
+            request.egress_client_certificate_pem,
+            request.egress_client_private_key_pem,
+        )
+    ):
+        raise WorkerProtocolError("egress_connection_material_missing")
+    socket_path = cast(str, request.egress_socket_path)
+    server_hostname = cast(str, request.egress_server_hostname)
+    server_ca_pem = cast(str, request.egress_server_ca_pem)
+    client_certificate_pem = cast(str, request.egress_client_certificate_pem)
+    client_private_key_pem = cast(str, request.egress_client_private_key_pem)
+    timeout = request.grant.egress.timeout_seconds if request.grant.egress is not None else 1.0
+    return UnixTlsEgressClient(
+        socket_path=socket_path,
+        server_hostname=server_hostname,
+        server_ca_pem=server_ca_pem,
+        client_certificate_pem=client_certificate_pem,
+        client_private_key_pem=client_private_key_pem,
+        timeout_seconds=timeout,
+    )

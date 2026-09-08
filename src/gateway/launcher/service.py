@@ -37,6 +37,10 @@ from gateway.hashing import sha256_hex
 from gateway.launcher.config import LauncherSettings
 from gateway.launcher.registry import LauncherToolSpec, build_launcher_registry
 from gateway.launcher.replay import GrantReplayGuard
+from gateway.workload.certificates import (
+    WorkloadCertificateError,
+    issue_invocation_worker_certificate,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +112,39 @@ class DockerExecutionLauncher:
         try:
             image_id = self._resolve_pinned_image_id(spec)
             result_private_key, result_public_key = generate_result_keypair()
+            egress_material: dict[str, str | None] = {
+                "egress_socket_path": None,
+                "egress_server_hostname": None,
+                "egress_server_ca_pem": None,
+                "egress_client_certificate_pem": None,
+                "egress_client_private_key_pem": None,
+            }
+            if spec.requires_egress:
+                if not all(
+                    (
+                        self._settings.egress_server_ca_pem,
+                        self._settings.worker_ca_private_key_pem,
+                        self._settings.worker_ca_certificate_pem,
+                    )
+                ):
+                    raise LauncherError("egress_configuration_missing")
+                try:
+                    worker_key, worker_certificate = issue_invocation_worker_certificate(
+                        ca_private_key_pem=self._settings.worker_ca_private_key_pem,
+                        ca_certificate_pem=self._settings.worker_ca_certificate_pem,
+                        invocation_id=action.invocation_id,
+                        worker_id=worker_id,
+                        ttl_seconds=min(self._settings.execution_timeout_seconds + 15, 300),
+                    )
+                except WorkloadCertificateError as exc:
+                    raise LauncherError("worker_identity_failed") from exc
+                egress_material = {
+                    "egress_socket_path": self._settings.egress_socket_path,
+                    "egress_server_hostname": self._settings.egress_server_hostname,
+                    "egress_server_ca_pem": self._settings.egress_server_ca_pem,
+                    "egress_client_certificate_pem": worker_certificate,
+                    "egress_client_private_key_pem": worker_key,
+                }
             worker_request = {
                 "grant": grant.model_dump(mode="json"),
                 "worker_id": worker_id,
@@ -115,11 +152,21 @@ class DockerExecutionLauncher:
                 "result_private_key_pem": result_private_key,
                 "expected_issuer": self._settings.grant_issuer,
                 "expected_audience": self._settings.grant_audience,
+                **egress_material,
             }
             encoded_request = json.dumps(worker_request, separators=(",", ":")).encode("utf-8")
             if len(encoded_request) > 64 * 1024:
                 raise LauncherError("grant_too_large")
 
+            container_options: dict[str, Any] = {}
+            if spec.requires_egress:
+                container_options["volumes"] = {
+                    self._settings.egress_socket_volume: {
+                        "bind": "/run/secure-agent-egress",
+                        "mode": "ro",
+                    }
+                }
+                container_options["group_add"] = ["20000"]
             container = self._docker.containers.create(
                 image=image_id,
                 entrypoint=list(spec.entrypoint),
@@ -141,13 +188,14 @@ class DockerExecutionLauncher:
                 tmpfs={"/tmp": "rw,noexec,nosuid,nodev,size=16m"},  # noqa: S108  # nosec B108
                 log_config={
                     "type": "local",
-                    "config": {"max-size": "128k", "max-file": "1", "compress": "false"},
+                    "config": {"max-size": "1m", "max-file": "1", "compress": "false"},
                 },
                 labels={
                     "secure-agent.role": "disposable-worker",
                     "secure-agent.invocation": action.invocation_id,
                     "secure-agent.artifact": spec.artifact_digest,
                 },
+                **container_options,
             )
             container.start()
             attached = container.attach_socket(params={"stdin": 1, "stream": 1})

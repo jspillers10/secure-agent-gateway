@@ -17,7 +17,12 @@ from typing import Any
 from pydantic import BaseModel
 
 from gateway.hashing import sha256_hex
-from gateway.registry.schemas import AdminRotateKeyArgs, DocumentsReadArgs, TicketsCreateArgs
+from gateway.registry.schemas import (
+    AdminRotateKeyArgs,
+    DocumentsReadArgs,
+    TicketsCreateArgs,
+    WebFetchTextArgs,
+)
 from gateway.risk import RiskLevel
 from gateway.tools_impl.admin import admin_rotate_key
 from gateway.tools_impl.documents import documents_read
@@ -36,14 +41,15 @@ class ToolSpec:
     required_scope: str
     approval_required: bool
     args_model: type[BaseModel]
-    handler: Callable[[BaseModel], dict[str, Any]]
+    handler: Callable[[BaseModel], dict[str, Any]] | None
+    requires_egress: bool = False
 
 
-# The three inert fixtures ship as one versioned Worker bundle. The Launcher
+# The inert fixtures and controlled web client ship as one versioned Worker bundle. The Launcher
 # resolves this logical artifact to a configured image and then creates the
 # container from Docker's immutable image ID, never from a caller-supplied tag.
 WORKER_ARTIFACT_DIGEST = sha256_hex(
-    {"bundle": "secure-agent-gateway-inert-tools", "protocol": "1.0", "version": 1}
+    {"bundle": "secure-agent-gateway-tools", "protocol": "1.0", "version": 2}
 )
 
 
@@ -74,6 +80,16 @@ TOOL_REGISTRY: Mapping[str, ToolSpec] = {
         approval_required=True,
         args_model=AdminRotateKeyArgs,
         handler=admin_rotate_key,  # type: ignore[arg-type]
+    ),
+    "web.fetch_text": ToolSpec(
+        name="web.fetch_text",
+        artifact_digest=WORKER_ARTIFACT_DIGEST,
+        risk=RiskLevel.LOW,
+        required_scope="web.fetch_text",
+        approval_required=False,
+        args_model=WebFetchTextArgs,
+        handler=None,
+        requires_egress=True,
     ),
 }
 

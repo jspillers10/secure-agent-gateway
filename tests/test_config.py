@@ -36,6 +36,10 @@ def test_load_settings_succeeds_with_all_required_vars() -> None:
     assert settings.jwt_algorithm == "RS256"
     assert settings.approver_identity == "dev-only-approver"
     assert settings.policy_timeout_seconds == 2.0
+    assert settings.web_fetch_allowed_origins == (
+        "https://example.com",
+        "https://www.example.com",
+    )
 
 
 def test_load_settings_fails_closed_when_vars_missing() -> None:
@@ -82,4 +86,37 @@ def test_internal_service_endpoint_must_use_https(endpoint: str) -> None:
     env = _base_env()
     env[endpoint] = "http://internal-service:8080"
     with pytest.raises(ConfigurationError, match="must use https"):
+        load_settings(env)
+
+
+def test_web_origins_and_limits_are_server_owned_and_canonical() -> None:
+    env = _base_env()
+    env["WEB_FETCH_ALLOWED_ORIGINS"] = "HTTPS://EXAMPLE.COM.,https://BÜCHER.example"
+    env["WEB_FETCH_MAX_REDIRECTS"] = "2"
+    env["WEB_FETCH_MAX_RESPONSE_BYTES"] = "4096"
+    env["WEB_FETCH_TIMEOUT_SECONDS"] = "1.5"
+    settings = load_settings(env)
+    assert settings.web_fetch_allowed_origins == (
+        "https://example.com",
+        "https://xn--bcher-kva.example",
+    )
+    assert settings.web_fetch_max_redirects == 2
+    assert settings.web_fetch_max_response_bytes == 4096
+    assert settings.web_fetch_timeout_seconds == 1.5
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("WEB_FETCH_ALLOWED_ORIGINS", "http://example.com"),
+        ("WEB_FETCH_ALLOWED_ORIGINS", "https://example.com/path"),
+        ("WEB_FETCH_MAX_REDIRECTS", "6"),
+        ("WEB_FETCH_MAX_RESPONSE_BYTES", "100"),
+        ("WEB_FETCH_TIMEOUT_SECONDS", "31"),
+    ],
+)
+def test_invalid_web_policy_configuration_fails_closed(name: str, value: str) -> None:
+    env = _base_env()
+    env[name] = value
+    with pytest.raises(ConfigurationError):
         load_settings(env)

@@ -10,10 +10,11 @@ WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY src ./src
 RUN pip install --no-cache-dir . \
-    && useradd --no-create-home --uid 10001 --shell /usr/sbin/nologin worker
+    && groupadd --gid 20000 egress \
+    && useradd --no-create-home --uid 10002 --gid 20000 --shell /usr/sbin/nologin egress \
+    && mkdir -p /run/secure-agent-egress \
+    && chown 10002:20000 /run/secure-agent-egress \
+    && chmod 0770 /run/secure-agent-egress
 
-LABEL org.secure-agent.role="disposable-worker" \
-      org.secure-agent.artifact-digest="sha256:5501c6970579525156e6a6b8c39ec733ad4714e7f3e85de39437cb81bd2fdfc4"
-
-USER 10001:10001
-ENTRYPOINT ["python", "-m", "gateway.worker.main"]
+USER 10002:20000
+ENTRYPOINT ["python", "-m", "gateway.egress.main"]

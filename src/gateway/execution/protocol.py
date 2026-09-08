@@ -46,6 +46,28 @@ class ApprovalBinding(ClosedModel):
         return self
 
 
+class EgressGrant(ClosedModel):
+    """Server-owned, signed authority for exactly one HTTPS text retrieval."""
+
+    operation: Literal["https_get_text"] = "https_get_text"
+    initial_url: str = Field(min_length=1, max_length=2048)
+    allowed_origins: tuple[str, ...] = Field(min_length=1, max_length=16)
+    approved_content_types: tuple[Literal["text/plain", "text/html"], ...] = (
+        "text/plain",
+        "text/html",
+    )
+    max_redirects: int = Field(default=3, ge=0, le=5)
+    max_response_bytes: int = Field(default=65_536, ge=1_024, le=1_048_576)
+    timeout_seconds: float = Field(default=5.0, ge=0.1, le=30.0)
+
+    @field_validator("allowed_origins")
+    @classmethod
+    def unique_origins(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if len(set(values)) != len(values):
+            raise ValueError("allowed origins must be unique")
+        return values
+
+
 class ActionEnvelope(ClosedModel):
     protocol_version: Literal["1.0"] = PROTOCOL_VERSION
     invocation_id: str = Field(min_length=1, max_length=128)
@@ -59,6 +81,7 @@ class ActionEnvelope(ClosedModel):
     approval: ApprovalBinding
     policy_version: str = Field(min_length=1, max_length=128)
     risk: Literal["low", "medium", "high"]
+    destination: str | None = Field(default=None, max_length=2048)
     created_at: datetime
 
     _created_at_aware = field_validator("created_at")(_require_aware)
@@ -82,6 +105,7 @@ class ExecutionGrant(ClosedModel):
     nonce: str = Field(min_length=24, max_length=256)
     action: ActionEnvelope
     action_digest: Digest = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    egress: EgressGrant | None = None
     signature: str = Field(min_length=32, max_length=2048)
 
     _issued_at_aware = field_validator("issued_at")(_require_aware)
@@ -93,6 +117,14 @@ class ExecutionGrant(ClosedModel):
             raise ValueError("grant expiry must be after issuance")
         if self.action.digest() != self.action_digest:
             raise ValueError("action digest does not match action envelope")
+        is_web_fetch = self.action.tool.name == "web.fetch_text"
+        if is_web_fetch != (self.egress is not None):
+            raise ValueError("web fetch and egress authority must be present together")
+        if self.egress is not None:
+            if self.action.destination != self.egress.initial_url:
+                raise ValueError("egress authority does not match action destination")
+            if self.action.arguments.get("url") != self.egress.initial_url:
+                raise ValueError("egress authority does not match canonical arguments")
         return self
 
     def signing_payload(self) -> dict[str, Any]:

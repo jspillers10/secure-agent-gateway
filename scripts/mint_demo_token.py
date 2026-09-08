@@ -44,7 +44,12 @@ def main() -> int:
         return 1
 
     private_key = private_key_path.read_text(encoding="utf-8")
-    scopes = args.scopes or ["documents.read", "tickets.write", "admin.rotate_key"]
+    scopes = args.scopes or [
+        "documents.read",
+        "tickets.write",
+        "admin.rotate_key",
+        "web.fetch_text",
+    ]
     now = int(time.time())
 
     payload = {

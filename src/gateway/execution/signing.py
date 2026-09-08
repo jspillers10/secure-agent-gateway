@@ -12,7 +12,12 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from pydantic import ValidationError
 
-from gateway.execution.protocol import ActionEnvelope, ExecutionGrant, ToolResultEnvelope
+from gateway.execution.protocol import (
+    ActionEnvelope,
+    EgressGrant,
+    ExecutionGrant,
+    ToolResultEnvelope,
+)
 from gateway.hashing import canonical_json_bytes
 
 
@@ -92,7 +97,13 @@ class ExecutionGrantSigner:
         self._audience = audience
         self._ttl_seconds = ttl_seconds
 
-    def issue(self, action: ActionEnvelope, *, now: datetime | None = None) -> ExecutionGrant:
+    def issue(
+        self,
+        action: ActionEnvelope,
+        *,
+        egress: EgressGrant | None = None,
+        now: datetime | None = None,
+    ) -> ExecutionGrant:
         issued_at = now or datetime.now(tz=UTC)
         unsigned: dict[str, Any] = {
             "protocol_version": "1.0",
@@ -103,6 +114,7 @@ class ExecutionGrantSigner:
             "nonce": secrets.token_urlsafe(32),
             "action": action.model_dump(mode="json"),
             "action_digest": action.digest(),
+            "egress": egress.model_dump(mode="json") if egress is not None else None,
         }
         candidate = ExecutionGrant.model_validate({**unsigned, "signature": "0" * 32})
         return candidate.model_copy(

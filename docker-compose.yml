@@ -3,7 +3,7 @@
 services:
   worker-image:
     profiles: ["worker-build"]
-    image: secure-agent-gateway-worker:milestone1
+    image: secure-agent-gateway-worker:milestone2
     build:
       context: .
       dockerfile: Dockerfile.worker
@@ -28,7 +28,9 @@ services:
     networks: [internal_net]
     volumes:
       - ./policy:/policy:ro
-      - ./devkeys:/keys:ro
+      - ./devkeys/opa-cert.pem:/keys/opa-cert.pem:ro
+      - ./devkeys/opa-key.pem:/keys/opa-key.pem:ro
+      - ./devkeys/gateway-client-ca-cert.pem:/keys/gateway-client-ca-cert.pem:ro
     healthcheck:
       test: ["CMD", "/opa", "eval", "-i", "/dev/null", "1"]
       interval: 5s
@@ -42,6 +44,8 @@ services:
     depends_on:
       opa:
         condition: service_healthy
+      egress-broker:
+        condition: service_started
     user: "${HOST_RUNTIME_UID:-0}:${HOST_RUNTIME_GID:-0}"
     group_add: ["${DOCKER_SOCKET_GID:-0}"]
     read_only: true
@@ -53,14 +57,26 @@ services:
       GRANT_PUBLIC_KEY_FILE: /keys/execution-grant-public.pem
       GRANT_ISSUER: secure-agent-gateway
       GRANT_AUDIENCE: secure-agent-worker-launcher
-      WORKER_IMAGE_REFERENCE: secure-agent-gateway-worker:milestone1
+      WORKER_IMAGE_REFERENCE: secure-agent-gateway-worker:milestone2
       WORKER_EXECUTION_TIMEOUT_SECONDS: "5"
-      WORKER_OUTPUT_LIMIT_BYTES: "65536"
+      WORKER_OUTPUT_LIMIT_BYTES: "524288"
       WORKER_MEMORY_LIMIT: 128m
       WORKER_NANO_CPUS: "500000000"
       WORKER_PIDS_LIMIT: "64"
+      EGRESS_SOCKET_VOLUME: secure-agent-gateway_egress_socket
+      EGRESS_SOCKET_PATH: /run/secure-agent-egress/broker.sock
+      EGRESS_SERVER_HOSTNAME: egress-broker
+      EGRESS_SERVER_CA_CERT_FILE: /keys/internal-server-ca-cert.pem
+      WORKER_CLIENT_CA_KEY_FILE: /keys/worker-client-ca-private.pem
+      WORKER_CLIENT_CA_CERT_FILE: /keys/worker-client-ca-cert.pem
     volumes:
-      - ./devkeys:/keys:ro
+      - ./devkeys/launcher-cert.pem:/keys/launcher-cert.pem:ro
+      - ./devkeys/launcher-key.pem:/keys/launcher-key.pem:ro
+      - ./devkeys/gateway-client-ca-cert.pem:/keys/gateway-client-ca-cert.pem:ro
+      - ./devkeys/execution-grant-public.pem:/keys/execution-grant-public.pem:ro
+      - ./devkeys/internal-server-ca-cert.pem:/keys/internal-server-ca-cert.pem:ro
+      - ./devkeys/worker-client-ca-cert.pem:/keys/worker-client-ca-cert.pem:ro
+      - ./devkeys/worker-client-ca-private.pem:/keys/worker-client-ca-private.pem:ro
       # High-value prototype trust assumption: this is the only socket mount.
       - /var/run/docker.sock:/var/run/docker.sock
 
@@ -76,7 +92,7 @@ services:
     tmpfs: [/tmp]
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
-    networks: [internal_net, edge_net]
+    networks: [internal_net, ingress_net]
     environment:
       JWT_ISSUER: https://issuer.secure-agent-gateway.local
       JWT_AUDIENCE: secure-agent-gateway
@@ -96,12 +112,131 @@ services:
       APPROVER_IDENTITY: dev-local-approver
       POLICY_TIMEOUT_SECONDS: "2.0"
       LAUNCHER_TIMEOUT_SECONDS: "10.0"
+      WEB_FETCH_ALLOWED_ORIGINS: https://fixture.secure-agent.test,https://redirect.secure-agent.test,https://rebinding.secure-agent.test
+      WEB_FETCH_MAX_REDIRECTS: "3"
+      WEB_FETCH_MAX_RESPONSE_BYTES: "65536"
+      WEB_FETCH_TIMEOUT_SECONDS: "5.0"
     volumes:
-      - ./devkeys:/keys:ro
+      - ./devkeys/public.pem:/keys/public.pem:ro
+      - ./devkeys/internal-server-ca-cert.pem:/keys/internal-server-ca-cert.pem:ro
+      - ./devkeys/gateway-client-cert.pem:/keys/gateway-client-cert.pem:ro
+      - ./devkeys/gateway-client-key.pem:/keys/gateway-client-key.pem:ro
+      - ./devkeys/execution-grant-private.pem:/keys/execution-grant-private.pem:ro
+      - ./devkeys/execution-grant-public.pem:/keys/execution-grant-public.pem:ro
+
+  ingress:
+    build:
+      context: .
+      dockerfile: Dockerfile.ingress
+    depends_on:
+      gateway:
+        condition: service_healthy
+    user: "10004:10004"
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [ingress_net, edge_net]
     ports:
-      - "127.0.0.1:8088:8000"
+      - "127.0.0.1:8088:8080"
+
+  egress-broker:
+    build:
+      context: .
+      dockerfile: Dockerfile.egress
+    depends_on:
+      web-fixture:
+        condition: service_started
+      protected-fixture:
+        condition: service_started
+    user: "${HOST_RUNTIME_UID:-10002}:20000"
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [fixture_net, protected_net]
+    environment:
+      EGRESS_SOCKET_PATH: /run/secure-agent-egress/broker.sock
+      EGRESS_SERVER_CERT_FILE: /keys/egress-broker-cert.pem
+      EGRESS_SERVER_KEY_FILE: /keys/egress-broker-key.pem
+      WORKER_CLIENT_CA_CERT_FILE: /keys/worker-client-ca-cert.pem
+      GRANT_PUBLIC_KEY_FILE: /keys/execution-grant-public.pem
+      GRANT_ISSUER: secure-agent-gateway
+      GRANT_AUDIENCE: secure-agent-worker-launcher
+      EGRESS_ALLOWED_ORIGINS: https://fixture.secure-agent.test,https://redirect.secure-agent.test,https://blocked.secure-agent.test,https://rebinding.secure-agent.test
+      EGRESS_DENIED_CIDRS: 11.78.0.0/24
+      EGRESS_MAX_REDIRECTS: "3"
+      EGRESS_MAX_RESPONSE_BYTES: "65536"
+      EGRESS_MAX_TIMEOUT_SECONDS: "5.0"
+      EGRESS_UPSTREAM_CA_FILE: /keys/internal-server-ca-cert.pem
+    volumes:
+      - ./devkeys/egress-broker-cert.pem:/keys/egress-broker-cert.pem:ro
+      - ./devkeys/egress-broker-key.pem:/keys/egress-broker-key.pem:ro
+      - ./devkeys/worker-client-ca-cert.pem:/keys/worker-client-ca-cert.pem:ro
+      - ./devkeys/execution-grant-public.pem:/keys/execution-grant-public.pem:ro
+      - ./devkeys/internal-server-ca-cert.pem:/keys/internal-server-ca-cert.pem:ro
+      - egress_socket:/run/secure-agent-egress
+
+  web-fixture:
+    build:
+      context: .
+      dockerfile: Dockerfile.web-fixture
+    user: "${HOST_RUNTIME_UID:-10003}:${HOST_RUNTIME_GID:-10003}"
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks:
+      fixture_net:
+        ipv4_address: 11.77.0.10
+        aliases:
+          - fixture.secure-agent.test
+          - redirect.secure-agent.test
+    volumes:
+      - ./devkeys/web-fixture-cert.pem:/keys/web-fixture-cert.pem:ro
+      - ./devkeys/web-fixture-key.pem:/keys/web-fixture-key.pem:ro
+      - connection_observations:/observations:ro
+
+  protected-fixture:
+    build:
+      context: .
+      dockerfile: Dockerfile.web-fixture
+    entrypoint: ["python", "/fixture/protected_connection_fixture.py"]
+    user: "${HOST_RUNTIME_UID:-10003}:${HOST_RUNTIME_GID:-10003}"
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks:
+      protected_net:
+        ipv4_address: 11.78.0.11
+        aliases:
+          - blocked.secure-agent.test
+          - rebinding.secure-agent.test
+    volumes:
+      - ./devkeys/protected-fixture-cert.pem:/keys/protected-fixture-cert.pem:ro
+      - ./devkeys/protected-fixture-key.pem:/keys/protected-fixture-key.pem:ro
+      - connection_observations:/observations
 
 networks:
   internal_net:
     internal: true
+  ingress_net:
+    internal: true
   edge_net: {}
+  fixture_net:
+    internal: true
+    ipam:
+      config:
+        - subnet: 11.77.0.0/24
+  protected_net:
+    internal: true
+    ipam:
+      config:
+        - subnet: 11.78.0.0/24
+
+volumes:
+  egress_socket:
+    name: secure-agent-gateway_egress_socket
+  connection_observations:
+    name: secure-agent-gateway_connection_observations

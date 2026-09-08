@@ -81,6 +81,11 @@ tools := {
 		"risk": "high",
 		"approval_required": true,
 	},
+	"web.fetch_text": {
+		"required_scope": "web.fetch_text",
+		"risk": "low",
+		"approval_required": false,
+	},
 }
 
 known_risk_levels := {"low", "medium", "high"}

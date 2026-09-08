@@ -10,12 +10,10 @@ layer an LLM-driven agent would sit behind: the boundary that decides,
 independent of anything the agent claims about itself, whether a
 requested tool call is allowed to happen at all.
 
-> **All tools in this repository are inert mocks.** `documents.read`
-> returns fixed in-memory text. `tickets.create` returns a fabricated
-> ticket record with a random id. `admin.rotate_key` never contacts a key
-> management system and never rotates a real credential; it always
-> returns a simulated result. No tool performs shell execution, network
-> I/O, or file I/O. See [`src/gateway/tools_impl/`](src/gateway/tools_impl/).
+> **Only `web.fetch_text` performs real I/O.** The three original tools remain
+> inert mocks. `web.fetch_text` can issue only a bounded HTTPS GET through the
+> authenticated egress broker; the disposable Worker remains network-disabled
+> and has no direct route to the origin. Returned web content is untrusted.
 
 ## What this demonstrates
 
@@ -47,6 +45,10 @@ every step:
 10. Emit one or more **redacted, structured audit events** per request:
    hashes of arguments and results, never raw values, and never an
    approval id or credential.
+11. For `web.fetch_text`, give the network-disabled Worker only a fixed Unix
+    socket and invocation-bound certificate; the broker independently checks
+    the signed destination, connect-time DNS answers, TLS hostname, redirects,
+    media type, size, and deadline before returning UTF-8 text.
 
 Full request/decision flow: [docs/architecture.md](docs/architecture.md).
 Full attacker-facing analysis: [docs/threat-model.md](docs/threat-model.md).
@@ -66,6 +68,8 @@ flowchart LR
     CrossCheck -- "only on allow +<br/>match + atomic consume" --> Grant["Signed execution grant"]
     Grant -- "mTLS" --> Launcher["Worker Launcher<br/>(only Docker socket holder)"]
     Launcher --> Worker["Fresh hardened Worker<br/>(no network)"]
+    Worker -. "invocation-bound mTLS<br/>over fixed Unix socket" .-> Egress["Egress broker"]
+    Egress -- "validated IP + TLS hostname<br/>GET only" --> Web["Allowed HTTPS origin"]
     Worker -- "per-run signed result" --> Launcher
     Launcher --> Gateway
     Gateway --> Audit[("Redacted audit log")]
@@ -112,19 +116,25 @@ python scripts/generate_dev_keys.py   # writes ./devkeys/, gitignored, never com
 docker compose --profile worker-build build worker-image
 docker compose up -d --build
 python scripts/smoke_test.py          # Gateway -> OPA -> Launcher -> fresh Workers
+python scripts/verify_milestone2.py   # Worker -> Unix-mTLS broker -> HTTPS fixture
+python scripts/verify_credential_mounts.py
+python scripts/verify_gateway_network.py
 python scripts/verify_worker_hardening.py
 docker compose down
 ```
 
-The gateway listens on `http://localhost:8088` (mapped from container port
-8000: 8000 is a common local dev port, so compose remaps it to avoid
-collisions; change the mapping in `docker-compose.yml` if you'd rather use
-8000). OPA and the Launcher have no published ports; the Gateway reaches them
-over mutually authenticated TLS on an isolated Docker network with no internet
-egress. Disposable Workers have no network attachment at all; see
+The credential-free fixed-target ingress listens on `http://localhost:8088`
+and forwards only to the Gateway. OPA, the Launcher, and the Gateway have no
+published ports; the Gateway reaches its required services over mutually
+authenticated TLS on an isolated Docker network with no internet egress.
+Disposable Workers have no network attachment at all; see
 [docs/architecture.md#docker-network-topology](docs/architecture.md#docker-network-topology)
 for why, and `scripts/verify_opa_hardening.py` for how to still query it
 directly for debugging.
+
+The controlled web tool does not change that posture. A web Worker gets only a
+read-only mount containing the broker's Unix socket. The broker is on a
+separate fixture network and owns DNS, TCP, TLS, redirects, and response limits.
 
 ### Manually exercise the API
 
@@ -172,6 +182,18 @@ curl -s http://localhost:8088/v1/tool-invocations \
 # -> {"decision": "allow", "result": {"status": "simulated_rotation_recorded", ...}}
 ```
 
+Fetch the allowlisted HTTPS fixture through the broker:
+
+```bash
+WEB_TOKEN=$(python scripts/mint_demo_token.py --scope web.fetch_text)
+
+curl -s http://localhost:8088/v1/tool-invocations \
+  -H "Authorization: Bearer $WEB_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"tool":"web.fetch_text","arguments":{"url":"https://fixture.secure-agent.test/text"}}' \
+  | python -m json.tool
+```
+
 ## Reproduction: verifying the security claims
 
 Every claim in the [threat model](docs/threat-model.md) has a
@@ -179,19 +201,47 @@ corresponding automated test. To reproduce the full validation:
 
 ```bash
 pip install -e ".[dev]"
-pytest -v                                            # 59 tests, includes every required scenario below
+pytest -v --cov=gateway --cov-report=term-missing    # Milestone 1 and 2 matrices
 ruff check src tests scripts && mypy src && bandit -r src -c pyproject.toml
 pip-audit                                             # dependency vulnerability scan
 docker run --rm -v "$(pwd)/policy:/policy" openpolicyagent/opa:0.70.0 test /policy -v
-docker run --rm -v "$(pwd)/policy:/policy" openpolicyagent/opa:0.70.0 check /policy
+docker run --rm -v "$(pwd)/policy:/policy" openpolicyagent/opa:0.70.0 check --strict /policy
 
 python scripts/generate_dev_keys.py
+docker compose --profile worker-build build worker-image
 docker compose up -d --build
 python scripts/smoke_test.py                          # host -> gateway, end-to-end
+python scripts/verify_milestone2.py                   # real Worker/broker/HTTPS controls
+docker run --rm --network none --read-only --group-add 20000 \
+  --tmpfs /tmp:rw,noexec,nosuid,nodev,size=16m \
+  -v secure-agent-gateway_egress_socket:/run/secure-agent-egress:ro \
+  -v "$(pwd)/scripts:/scripts:ro" \
+  -v "$(pwd)/devkeys/internal-server-ca-cert.pem:/keys/internal-server-ca-cert.pem:ro" \
+  -v "$(pwd)/devkeys/execution-grant-private.pem:/keys/execution-grant-private.pem:ro" \
+  -v "$(pwd)/devkeys/worker-client-ca-private.pem:/keys/worker-client-ca-private.pem:ro" \
+  -v "$(pwd)/devkeys/worker-client-ca-cert.pem:/keys/worker-client-ca-cert.pem:ro" \
+  --entrypoint python secure-agent-gateway-gateway \
+  /scripts/verify_broker_mtls.py                      # live broker auth/binding
+python scripts/verify_credential_mounts.py            # per-service key isolation
+python scripts/verify_gateway_network.py              # host ingress + Gateway confinement
+python scripts/verify_worker_hardening.py              # Worker isolation + cleanup
 docker run --rm --network secure-agent-gateway_internal_net \
-  -v "$(pwd)/scripts:/scripts:ro" --entrypoint python secure-agent-gateway-gateway \
+  -v "$(pwd)/scripts:/scripts:ro" \
+  -v "$(pwd)/devkeys/internal-server-ca-cert.pem:/keys/internal-server-ca-cert.pem:ro" \
+  -v "$(pwd)/devkeys/gateway-client-cert.pem:/keys/gateway-client-cert.pem:ro" \
+  -v "$(pwd)/devkeys/gateway-client-key.pem:/keys/gateway-client-key.pem:ro" \
+  --entrypoint python secure-agent-gateway-gateway \
   /scripts/verify_opa_hardening.py                    # internal_net -> opa directly
-docker compose down
+docker run --rm --network secure-agent-gateway_internal_net \
+  -v "$(pwd)/scripts:/scripts:ro" \
+  -v "$(pwd)/devkeys/internal-server-ca-cert.pem:/keys/internal-server-ca-cert.pem:ro" \
+  -v "$(pwd)/devkeys/gateway-client-cert.pem:/keys/gateway-client-cert.pem:ro" \
+  -v "$(pwd)/devkeys/gateway-client-key.pem:/keys/gateway-client-key.pem:ro" \
+  -v "$(pwd)/devkeys/launcher-cert.pem:/keys/launcher-cert.pem:ro" \
+  -v "$(pwd)/devkeys/launcher-key.pem:/keys/launcher-key.pem:ro" \
+  --entrypoint python secure-agent-gateway-gateway \
+  /scripts/verify_internal_mtls.py                    # internal certificate negatives
+docker compose down -v
 ```
 
 Required scenarios and where each is tested:
@@ -227,6 +277,9 @@ Required scenarios and where each is tested:
 | Client-supplied `granted_by` rejected | `tests/test_approvals.py::test_create_approval_ignores_client_supplied_granted_by` |
 | Approval lifecycle audited (created / rejected / consumed / binding failure) | `tests/test_audit.py::test_approval_creation_audited_and_redacted`, `::test_approval_rejection_audited`, `::test_approval_consumption_audited`, `::test_approval_replay_binding_failure_audited` |
 | OPA management API rejects policy mutation | `policy/system/authz_test.rego`, `scripts/verify_opa_hardening.py` (live OPA) |
+| Broker rejects an untrusted Worker CA before egress | `tests/test_egress.py::test_invalid_broker_credentials_fail_before_dns_and_egress`, `scripts/verify_broker_mtls.py` (live Unix mTLS) |
+| Broker rejects a trusted Worker identity bound to another invocation | `tests/test_egress.py::test_invalid_broker_credentials_fail_before_dns_and_egress`, `scripts/verify_broker_mtls.py` (live TLS success followed by authorization denial) |
+| Matching broker identity and grant succeed | `tests/test_egress.py::test_real_web_tool_traverses_signed_worker_broker_contract`, `scripts/verify_broker_mtls.py` (live positive control) |
 
 Plus algorithm-confusion coverage
 (`test_algorithm_confusion_none_rejected`,
@@ -247,14 +300,15 @@ src/gateway/
   execution/    closed envelopes, canonical hashing, signing, Launcher client, audit
   launcher/     narrow Docker execution service, registry, replay guard
   worker/       one-shot isolated Worker protocol/runtime
+  egress/       URL/IP policy, closed Unix-mTLS protocol, broker, HTTPS transport
   workload/     development workload-certificate validation
   tools_impl/   inert mock tool handlers
   api/          FastAPI routes, dependencies, request/response schemas
 policy/gateway/  Rego authorization policy (owns tool -> scope/risk/approval) + opa test suite
 policy/system/   OPA's own read-only management-API policy + opa test suite
 tests/           pytest suite (unit + API-level)
-scripts/         key generation, smoke/OPA/Worker checks, latency measurement
-docs/            architecture, threat model, research roadmap, Milestone-1 report
+scripts/         key generation, smoke/OPA/Worker/egress checks, latency measurements
+docs/            architecture, threat model, roadmap, Milestone 1/2 reports
 ```
 
 ## Security assumptions and known limitations
@@ -264,20 +318,21 @@ and [docs/threat-model.md](docs/threat-model.md#known-limitations). In short: th
 is in-memory and single-process (not production-durable), the approver
 credential is a static placeholder (not a real approver identity system),
 there's no rate limiting, workload certificates are development fixtures,
-replay state is process-local, the Gateway retains edge-network egress, and
-the Launcher/Docker host boundary remains a high-value trust assumption. See
-[the Milestone-1 implementation report](docs/milestone-1-implementation.md).
+replay state is process-local, the credential-free ingress retains ordinary
+bridge exposure, and the Launcher/Docker host boundary remains a high-value
+trust assumption. See
+[the Milestone-1 implementation report](docs/milestone-1-implementation.md) and
+[Milestone-2 implementation report](docs/milestone-2-implementation.md).
 
 ## Roadmap
 
-Beyond this vertical slice:
+Beyond the implemented Milestones 1 and 2:
 
 - **Stronger isolation comparison**: evaluate gVisor or a microVM against the
   current disposable Docker boundary without changing the signed protocol.
-- **Untrusted tool output**: treat a tool's *return value* as
-  attacker-influenced input once real, non-inert tools exist (e.g. a
-  document-fetch tool returning content from an external source), with
-  output scanning/sanitization before it reaches an agent or LLM.
+- **Untrusted tool output**: strengthen the current explicit untrusted-content
+  limitation with a dedicated boundary, scanning, and safe rendering before
+  external content reaches an agent or LLM.
 - **Production workload identity**: replace local development CAs with
   automated enrollment, rotation, revocation, and protected workload keys.
 - **Adversarial evaluations**: a red-team harness that scripts prompt-

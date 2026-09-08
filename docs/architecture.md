@@ -17,7 +17,9 @@ flowchart LR
 
     OPA["Open Policy Agent<br/>policy/gateway/authz.rego<br/>(source of truth #2:<br/>tool -> scope/risk/approval)"]
     Launcher["Worker Launcher<br/>(only Docker API client/socket)"]
-    Worker["Fresh hardened Worker<br/>(three inert fixture tools)"]
+    Worker["Fresh hardened Worker<br/>(three inert fixtures + web.fetch_text)"]
+    Egress["Egress broker<br/>(TLS over Unix socket;<br/>DNS/IP/TLS/redirect policy)"]
+    External["Explicitly allowed HTTPS origin"]
 
     Agent -- "Bearer: delegated-identity JWT" --> API
     API --> Identity
@@ -29,6 +31,8 @@ flowchart LR
     API -- "signed, short-lived grant<br/>over mTLS" --> Launcher
     Launcher -- "one request over stdin" --> Worker
     Worker -- "per-run signed result" --> Launcher
+    Worker -- "invocation-bound mTLS<br/>over fixed Unix socket" --> Egress
+    Egress -- "validated IP + TLS hostname<br/>GET only" --> External
     Launcher -- "closed result over mTLS" --> API
     API --> Audit
 ```
@@ -68,10 +72,21 @@ flowchart LR
   ID and a fixed entry point.
 - **Disposable Worker**: one non-root, read-only, network-disabled container
   per accepted grant. It receives one bounded stdin record, re-verifies the
-  grant, executes one of the three inert fixtures, signs the result with a
-  per-run key, and exits. It has no Docker SDK or socket.
-- **Mock tools**: pure, inert functions executed only inside the Worker. No
-  shell, no network, no real side effects (`src/gateway/tools_impl/`).
+  grant, executes one registered tool, signs the result with a per-run key,
+  and exits. It has no Docker SDK or socket. A `web.fetch_text` invocation gets
+  one read-only mount containing only the broker's Unix socket; it still has no
+  Docker network attachment.
+- **Egress broker**: the only component that resolves names or opens external
+  sockets for a Worker. It verifies an invocation-bound Worker certificate and
+  the signed grant, authorizes the canonical origin, validates every DNS answer
+  against both universal address classes and deployment-specific denied CIDRs
+  immediately before connecting, connects to the validated address while
+  preserving TLS hostname verification, and repeats the complete decision for
+  every redirect. It emits one redacted decision record for every attempted hop.
+- **Tools**: three existing pure inert fixtures plus `web.fetch_text`, whose only
+  network-capable operation is the closed broker request. The Worker never
+  receives an HTTP method, header, cookie, credential, proxy, socket address,
+  or runtime-network option from the caller.
 - **Audit emitters**: two closed Pydantic schemas (`AuditEvent` for the
   tool-invocation lifecycle, `ApprovalAuditEvent` for the approval
   lifecycle) that structurally cannot carry raw arguments, tokens,
@@ -80,6 +95,18 @@ flowchart LR
   Worker lifecycle schemas record accepted/start/terminal provenance without
   arguments, credentials, grants, nonces, or raw results
   (`src/gateway/execution/audit.py`).
+
+## Development credential distribution
+
+Compose mounts individual credential files rather than the `devkeys` directory.
+The Gateway alone receives the execution-grant private key; the Launcher alone
+receives the Worker client-CA private key; OPA receives only its server identity
+and Gateway-client CA certificate; and the broker receives its server identity,
+the Worker CA certificate, the grant public key, and its upstream trust root.
+The allowed and protected fixtures have separate server identities. The
+credential-free ingress receives no key mount. Evaluation containers likewise
+receive only the public or private files required for the specific test case;
+negative credential tests document why they need a signing or CA private key.
 
 ## Identity model
 
@@ -126,6 +153,7 @@ sequenceDiagram
     participant OPA
     participant Launcher as Worker Launcher
     participant Worker as Disposable Worker
+    participant Egress as Egress Broker
 
     Agent->>Gateway: POST /v1/tool-invocations<br/>Authorization: Bearer <JWT><br/>{tool, arguments, approval_id?}
     Gateway->>Gateway: Verify signature, iss, aud, exp, sub==agent_id, claims<br/>(RS256-only allow-list, no alg confusion)
@@ -166,7 +194,17 @@ sequenceDiagram
         Gateway->>Launcher: POST /v1/executions over mTLS<br/>{grant only; no runtime controls}
         Launcher->>Launcher: Verify signature, claims, bindings, and nonce;<br/>atomically claim nonce
         Launcher->>Worker: Create fresh hardened container by immutable image ID;<br/>deliver one bounded stdin record
-        Worker->>Worker: Re-verify grant and execute fixed-registry fixture
+        Worker->>Worker: Re-verify grant and execute fixed-registry tool
+        opt web.fetch_text
+            Launcher->>Worker: Add fixed read-only broker socket + fresh<br/>invocation/Worker-bound client certificate
+            Worker->>Egress: TLS over Unix socket: {worker_id, signed grant}<br/>(URL exists only in the signed action)
+            Egress->>Egress: Verify certificate role/invocation, grant, limits,<br/>canonical origin, all connect-time DNS answers
+            Egress->>Egress: Connect to validated IP; verify TLS for original hostname;<br/>send fixed GET without cookies/auth
+            loop each redirect, maximum 3
+                Egress->>Egress: Canonicalize, authorize, resolve, and validate again
+            end
+            Egress-->>Worker: Closed bounded UTF-8 result + per-hop decision chain
+        end
         Worker-->>Launcher: Per-run signed ToolResultEnvelope
         Launcher->>Launcher: Verify invocation/nonce/worker/tool/artifact binding; destroy Worker
         alt Launcher, Worker, protocol, or cleanup fails
@@ -177,6 +215,48 @@ sequenceDiagram
     end
     Gateway->>Gateway: Emit redacted audit event(s) (always, every branch)
 ```
+
+## Controlled egress protocol
+
+`web.fetch_text` accepts exactly one argument, `url`. Validation converts it
+to one canonical HTTPS form before the argument digest and `ActionEnvelope`
+are created. The signed `ExecutionGrant.egress` authority contains the same
+initial URL, the server-configured origin set, the two permitted media types
+(`text/plain` and `text/html`), a three-hop redirect ceiling, a 64 KiB body
+ceiling, and a five-second deadline. The broker also has its own fixed copy of
+those policy ceilings and refuses a grant that is broader. There is no broker
+field for a method, arbitrary URL, headers, cookies, credentials, proxy,
+address, or transport option.
+
+The Launcher issues a new client certificate for each accepted web invocation.
+Its only URI SAN is
+`spiffe://secure-agent-gateway/worker/{invocation_id}/{worker_id}`. The broker's
+TLS stack requires the dedicated Worker client CA; application-layer validation
+then requires that exact SAN to match both the signed action and broker request.
+The broker also verifies grant signature, issuer, audience, expiry, tool,
+artifact, argument digest, approval binding, egress operation, origin subset,
+and limits before DNS. A nonce is accepted once per broker process.
+
+For each hop the broker:
+
+1. rejects controls, whitespace, backslashes, fragments, user-info, non-HTTPS
+   schemes, non-443 ports, malformed percent escapes, alternate numeric hosts,
+   and invalid IDNA; lowercases and IDNA-encodes the host, removes DNS-equivalent
+   trailing dots, and normalizes percent-escape case;
+2. requires the canonical origin in both the signed grant and broker policy;
+3. resolves once at connection time and rejects the entire answer set if any
+   address is loopback, private, link-local, multicast, unspecified, reserved,
+   non-global, or a known metadata address (including IPv4-mapped IPv6);
+4. connects directly to one validated address without a second name lookup,
+   then verifies TLS for the original canonical hostname; and
+5. sends a fixed HTTP/1.1 `GET` with `Accept-Encoding: identity`, no cookie or
+   authorization state, and bounded deadline/body processing.
+
+Redirect responses do not inherit the prior decision. Their `Location` is
+resolved against the current URL and starts the same five-step process as a new
+hop. The broker records only a destination hash, allowed origin, hashed
+resolved addresses, decision/reason, and DNS/broker duration—never response
+content, grants, certificates, keys, cookies, or credentials.
 
 ## Response shape
 
@@ -281,7 +361,12 @@ flowchart LR
     Host["Host machine<br/>(curl, smoke_test.py)"]
 
     subgraph edge["edge_net (normal bridge)"]
-        Gateway["gateway<br/>127.0.0.1:8088 published"]
+        Ingress["credential-free fixed-target ingress<br/>127.0.0.1:8088 published"]
+    end
+
+    subgraph ingress["ingress_net (Docker internal: true)"]
+        Ingress
+        Gateway["gateway<br/>no published port"]
     end
 
     subgraph internal["internal_net (Docker internal: true,<br/>no route to the internet)"]
@@ -290,10 +375,24 @@ flowchart LR
         Launcher["launcher<br/>mTLS, no published port<br/>only Docker socket holder"]
     end
 
-    Host -- "127.0.0.1:8088" --> Gateway
+    subgraph fixture["fixture_net (Docker internal: true)"]
+        Broker["egress-broker<br/>no published port"]
+        Fixture["allowed HTTPS fixture<br/>11.77.0.10"]
+    end
+
+    subgraph protected["protected_net (Docker internal: true;<br/>deployment-denied CIDR)"]
+        Broker
+        Protected["protected TCP observer<br/>11.78.0.11"]
+    end
+
+    Host -- "127.0.0.1:8088" --> Ingress
+    Ingress -- "fixed gateway:8000 target" --> Gateway
     Gateway -- "https://opa:8181 (mTLS)" --> OPA
     Gateway -- "https://launcher:8443 (mTLS + signed grant)" --> Launcher
     Launcher -- "Docker API" --> Worker["fresh Worker<br/>no network attachment"]
+    Worker -. "read-only named volume:<br/>one Unix socket; TLS inside" .-> Broker
+    Broker -- "validated address + TLS hostname<br/>fixed GET" --> Fixture
+    Broker -. "CIDR policy denies before connect" .-> Protected
 ```
 
 `internal_net` is a Docker Compose network with `internal: true`: Docker
@@ -304,6 +403,18 @@ assumptions for how this was checked). Both `gateway` and `opa` sit on
 it, and it carries the mutually authenticated Gateway-to-OPA and
 Gateway-to-Launcher control channels. Disposable Workers are attached to no
 Docker network at all.
+
+The egress broker is not attached to `internal_net` and exposes no TCP port to
+the Worker. In the reproducible Compose evaluation it is attached to
+`fixture_net`, where the allowlisted deterministic HTTPS fixture has a fixed
+globally classified test address, and `protected_net`, whose entire subnet is
+in the broker's server-owned deployment-denied CIDR set. An otherwise
+allowlisted hostname resolves on `protected_net` to prove DNS occurs but the
+connector does not run. The Worker is still created with
+`network_disabled=True`; Docker attaches only the server-owned named volume at
+`/run/secure-agent-egress` in read-only mode. Possessing the socket path is not
+enough: the TLS handshake requires a fresh invocation-bound Worker credential,
+and the signed grant supplies the only permitted destination and operation.
 
 `opa` is attached to **only** `internal_net` and has no published port at
 all. This was a deliberate choice after finding, empirically, that Docker
@@ -316,15 +427,14 @@ of OPA not being directly reachable from the host (see
 `scripts/verify_opa_hardening.py` for how it's still tested, from a
 container joined to the same internal network).
 
-`gateway` is additionally attached to `edge_net`, an ordinary
-non-internal bridge network, solely so its own port can be published to
-`127.0.0.1:8088` for manual curl testing and `scripts/smoke_test.py`.
-That second network leg does mean the gateway container itself retains
-real network-level egress capability; it is not egress-blocked the way
-`opa` is. See `docs/threat-model.md`'s known limitations for that
-tradeoff made explicit, and why it's judged acceptable (the gateway's own
-code never constructs an outbound HTTP client except `OPAHttpPolicyClient`,
-targeting only the configured `OPA_URL`).
+`gateway` is attached only to the internal control and ingress networks. A
+direct published-port experiment on Docker Desktop timed out when the service
+had only an `internal: true` network, so Compose uses a small credential-free
+ingress on `edge_net`. That process has one compiled-in upstream,
+`gateway:8000`, shares only `ingress_net` with the Gateway, and has no key,
+token, Docker socket, or control-plane network. Host ingress therefore remains
+available while the Gateway itself has no Internet, host-gateway, fixture, or
+protected-network route.
 
 OPA's own HTTPS API requires a client certificate signed by the development
 Gateway-client CA. Its `--authorization=basic` policy in

@@ -1,8 +1,9 @@
 #!/usr/bin/env python
 """Generate local, ephemeral identity and workload credentials for Compose.
 
-Writes the delegated-token keypair, execution-grant keypair, two development
-CAs, and Gateway/Launcher/OPA workload certificates under ./devkeys. This
+Writes the delegated-token keypair, execution-grant keypair, development CAs,
+and the Gateway, Launcher, OPA, broker, and separate fixture identities under
+./devkeys. Compose mounts only the files required by each service. This
 directory and every PEM file are gitignored. These credentials are local
 fixtures, not production workload identity.
 
@@ -129,9 +130,14 @@ def main() -> int:
     _write("execution-grant-public.pem", _public_pem(grant_key))
 
     client_ca_key, client_ca_cert = _create_ca("secure-agent-development-client-ca")
+    worker_ca_key, worker_ca_cert = _create_ca("secure-agent-development-worker-client-ca")
     server_ca_key, server_ca_cert = _create_ca("secure-agent-development-server-ca")
     _write("gateway-client-ca-private.pem", _private_pem(client_ca_key), private=True)
     _write("gateway-client-ca-cert.pem", client_ca_cert.public_bytes(serialization.Encoding.PEM))
+    _write("worker-client-ca-private.pem", _private_pem(worker_ca_key), private=True)
+    _write(
+        "worker-client-ca-cert.pem", worker_ca_cert.public_bytes(serialization.Encoding.PEM)
+    )
     _write("internal-server-ca-private.pem", _private_pem(server_ca_key), private=True)
     _write("internal-server-ca-cert.pem", server_ca_cert.public_bytes(serialization.Encoding.PEM))
 
@@ -159,12 +165,51 @@ def main() -> int:
         usage=ExtendedKeyUsageOID.SERVER_AUTH,
         dns_names=("opa",),
     )
+    egress_key, egress_cert = _create_leaf(
+        ca_key=server_ca_key,
+        ca_certificate=server_ca_cert,
+        common_name="egress-broker",
+        uri="spiffe://secure-agent-gateway/egress-broker",
+        usage=ExtendedKeyUsageOID.SERVER_AUTH,
+        dns_names=("egress-broker",),
+    )
+    fixture_key, fixture_cert = _create_leaf(
+        ca_key=server_ca_key,
+        ca_certificate=server_ca_cert,
+        common_name="milestone2-web-fixture",
+        uri="spiffe://secure-agent-gateway/milestone2-web-fixture",
+        usage=ExtendedKeyUsageOID.SERVER_AUTH,
+        dns_names=(
+            "fixture.secure-agent.test",
+            "redirect.secure-agent.test",
+            "blocked.secure-agent.test",
+        ),
+    )
+    protected_fixture_key, protected_fixture_cert = _create_leaf(
+        ca_key=server_ca_key,
+        ca_certificate=server_ca_cert,
+        common_name="milestone2-protected-fixture",
+        uri="spiffe://secure-agent-gateway/milestone2-protected-fixture",
+        usage=ExtendedKeyUsageOID.SERVER_AUTH,
+        dns_names=("blocked.secure-agent.test", "rebinding.secure-agent.test"),
+    )
     _write("gateway-client-key.pem", _private_pem(gateway_key), private=True)
     _write("gateway-client-cert.pem", gateway_cert.public_bytes(serialization.Encoding.PEM))
     _write("launcher-key.pem", _private_pem(launcher_key), private=True)
     _write("launcher-cert.pem", launcher_cert.public_bytes(serialization.Encoding.PEM))
     _write("opa-key.pem", _private_pem(opa_key), private=True)
     _write("opa-cert.pem", opa_cert.public_bytes(serialization.Encoding.PEM))
+    _write("egress-broker-key.pem", _private_pem(egress_key), private=True)
+    _write("egress-broker-cert.pem", egress_cert.public_bytes(serialization.Encoding.PEM))
+    _write("web-fixture-key.pem", _private_pem(fixture_key), private=True)
+    _write("web-fixture-cert.pem", fixture_cert.public_bytes(serialization.Encoding.PEM))
+    _write(
+        "protected-fixture-key.pem", _private_pem(protected_fixture_key), private=True
+    )
+    _write(
+        "protected-fixture-cert.pem",
+        protected_fixture_cert.public_bytes(serialization.Encoding.PEM),
+    )
 
     print("All files are gitignored and development-only. Do not use them in production.")
     return 0

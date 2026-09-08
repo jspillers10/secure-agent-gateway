@@ -34,11 +34,19 @@ class InProcessLauncher:
     handlers itself.
     """
 
-    def __init__(self, *, grant_public_key_pem: str, issuer: str, audience: str) -> None:
+    def __init__(
+        self,
+        *,
+        grant_public_key_pem: str,
+        issuer: str,
+        audience: str,
+        egress_client: object | None = None,
+    ) -> None:
         self._grant_public_key_pem = grant_public_key_pem
         self._issuer = issuer
         self._audience = audience
         self._replay_guard = GrantReplayGuard()
+        self._egress_client = egress_client
 
     async def execute(self, grant: ExecutionGrant) -> ToolResultEnvelope:
         action = grant.action
@@ -102,7 +110,8 @@ class InProcessLauncher:
                     result_private_key_pem=result_private_key,
                     expected_issuer=self._issuer,
                     expected_audience=self._audience,
-                )
+                ),
+                egress_client=self._egress_client,
             )
             verify_tool_result(
                 result,

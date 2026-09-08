@@ -13,7 +13,7 @@ from typing import Any
 
 import docker
 
-WORKER_IMAGE = "secure-agent-gateway-worker:milestone1"
+WORKER_IMAGE = "secure-agent-gateway-worker:milestone2"
 WORKER_LABEL = "secure-agent.role=disposable-worker"
 SOCKET_DESTINATION = "/var/run/docker.sock"
 
@@ -30,9 +30,29 @@ def main() -> int:
     services: dict[str, Any] = {}
     for container in client.containers.list():
         service = container.labels.get("com.docker.compose.service")
-        if service in {"gateway", "launcher", "opa"}:
+        if service in {
+            "gateway",
+            "launcher",
+            "opa",
+            "egress-broker",
+            "web-fixture",
+            "protected-fixture",
+            "ingress",
+        }:
             services[service] = container
-    check("compose services discovered", set(services) == {"gateway", "launcher", "opa"})
+    check(
+        "compose services discovered",
+        set(services)
+        == {
+            "gateway",
+            "launcher",
+            "opa",
+            "egress-broker",
+            "web-fixture",
+            "protected-fixture",
+            "ingress",
+        },
+    )
 
     socket_holders = []
     for service, container in services.items():

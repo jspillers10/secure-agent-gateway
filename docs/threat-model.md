@@ -6,7 +6,8 @@ This threat model covers the vertical slice implemented in this repo: the
 `POST /v1/tool-invocations` and `POST /v1/approvals` endpoints, delegated-
 identity verification, the fixed tool registry, OPA-based authorization,
 the approval store, signed execution protocol, Worker Launcher, disposable
-Docker Workers, development workload authentication, and audit trail. It does
+Docker Workers, controlled egress broker, real read-only `web.fetch_text` tool,
+development workload authentication, and audit trail. It does
 **not** cover an LLM,
 because there isn't one yet; see [Roadmap](../README.md#roadmap).
 
@@ -19,19 +20,24 @@ flowchart TB
     end
 
     subgraph Trusted["Trusted control plane (this repo)"]
-        Gateway["Gateway process<br/>(internal_net + edge_net)"]
+        Ingress["Credential-free ingress<br/>(edge_net + ingress_net)"]
+        Gateway["Gateway process<br/>(internal networks only)"]
         OPA["OPA process<br/>(mTLS, internal-only)"]
         Launcher["Worker Launcher<br/>(mTLS; only Docker socket holder)"]
+        Broker["Egress broker<br/>(destination policy + external sockets)"]
     end
 
     subgraph Contained["Per-invocation containment boundary"]
-        Worker["Disposable Worker<br/>(no network, socket, or host mounts)"]
+        Worker["Disposable Worker<br/>(no network; optional fixed<br/>read-only broker socket mount)"]
     end
 
-    Agent -- "boundary 1: bearer token<br/>(127.0.0.1:8088 only)" --> Gateway
+    Agent -- "boundary 1: bearer token<br/>(127.0.0.1:8088 only)" --> Ingress
+    Ingress -- "fixed gateway:8000 target" --> Gateway
     Gateway -- "boundary 2: mTLS + SPIFFE-role authorization" --> OPA
     Gateway -- "boundary 3: mTLS + signed grant" --> Launcher
     Launcher -- "boundary 4: fixed Docker create API + one-use stdin" --> Worker
+    Worker -- "boundary 5: invocation-bound mTLS<br/>over fixed Unix socket" --> Broker
+    Broker -- "boundary 6: validated IP + TLS hostname<br/>fixed HTTPS GET" --> External["Allowed HTTPS origin<br/>(content untrusted)"]
 ```
 
 - **Boundary 1 (Agent → Gateway):** the only boundary a real attacker
@@ -51,8 +57,17 @@ flowchart TB
 - **Boundary 4 (Launcher → Worker):** the Launcher alone has Docker authority.
   It selects a registry artifact and immutable image ID, creates a fresh
   hardened container, and sends one bounded record through stdin. The Worker
-  has no network, Docker SDK/socket, host mount, or persistent state and signs
-  its result with a per-run key.
+  has no Docker network, Docker SDK/socket, host path, or persistent state and
+  signs its result with a per-run key. A web invocation receives only the fixed
+  broker-socket named volume.
+- **Boundary 5 (Worker → broker):** TLS is carried over the Unix socket and
+  requires a short-lived client certificate whose sole URI SAN binds the exact
+  invocation and Worker IDs. The broker independently verifies that identity,
+  the signed grant, its expiry/replay state, tool/artifact/argument bindings,
+  destination authority, and fixed limits before DNS.
+- **Boundary 6 (broker → origin):** the broker owns DNS, TCP, TLS, HTTP parsing,
+  redirect handling, and response bounds. Origin content is explicitly
+  untrusted even when transport and destination checks succeed.
 
 Everything inside "Trusted compute" is code and configuration this repo
 controls and can reason about statically. Nothing outside it is trusted,
@@ -69,6 +84,8 @@ OPA (OPA never reads those fields from gateway input at all; see
 | Delegated-identity signing key (private) | Compromise lets an attacker impersonate any agent/user pair with any scopes. Never present in the gateway process; only the public key is. |
 | Execution-grant workload key (private) | Compromise lets an attacker mint Launcher-accepted grants until key rotation or grant expiry. Present only in the Gateway. |
 | Development workload CA keys | Compromise permits impersonating an internal service in the local prototype. Generated locally, gitignored, and not production PKI. |
+| Per-invocation Worker credential / Worker client CA | Permits access to the broker socket, but only with a matching unexpired signed grant. The CA key is held by the trusted Launcher in this prototype. |
+| Destination policy and egress audit chain | Determines which public HTTPS origins and resolved addresses can receive connections and supplies evidence for every redirect hop. |
 | Launcher Docker authority | Compromise can create arbitrary containers and may amount to host compromise. Only the narrow Launcher has this authority. |
 | Approval records | Authorize a high-risk, otherwise-blocked action. Must be unforgeable and single-use. |
 | Audit trail | The only record of who did what. Must be complete and must not itself become a data leak. |
@@ -99,6 +116,8 @@ relevant, the test that exercises it.
 | Client reuses one identity's approval under another identity | Approval records are bound to `(agent_id, delegated_user_id)`; mismatch is rejected. `test_approval_for_different_identity_denied`. |
 | Grant or result fields are changed after authorization | Closed envelopes commit canonical arguments/actions/results; RSA signatures and exact invocation/tool/artifact/approval binding are rechecked at each boundary. `tests/test_execution_protocol.py`. |
 | Caller supplies an image, command, mount, capability, network, or host path | The Launcher's only request field is `grant`; all runtime configuration comes from its own registry and fixed create call. `tests/test_launcher.py::test_launcher_api_rejects_every_caller_runtime_control`. |
+| Caller or Worker changes the HTTP method, URL, headers, credentials, or limits after authorization | The broker request has only `{protocol_version, operation, worker_id, grant}`. The URL and limits exist only in the signed grant, and the operation literal is fixed to `https_get_text`. Unknown fields are rejected. |
+| URL parsing differences enable scheme, user-info, port, trailing-dot, IDNA, encoded-IP, or hostname confusion | One canonical parser runs before signing and again at every broker hop. It rejects ambiguous forms and normalizes case, trailing dots, IDNA, and percent escapes. `tests/test_egress.py`. |
 
 ### Repudiation
 
@@ -116,11 +135,15 @@ relevant, the test that exercises it.
 | Audit log leaks the approval id or the approver credential | Neither `AuditEvent` nor `ApprovalAuditEvent` has a field for either; the schema has no place to put them, by design (see the [approval provenance correction](architecture.md#two-phase-approval-flow)). `test_approval_creation_audited_and_redacted`, `test_approval_consumption_audited`, `test_approval_replay_binding_failure_audited` all assert the id and, where applicable, the `X-Approver-Key` value are absent from the captured log text, not just absent from one field. |
 | A tool handler's exception message (which might contain internal details) reaches the client | All handler exceptions are caught, logged server-side only, and converted to a generic `tool_execution_failed` response. `test_mock_tool_exception_fails_safely`, `test_unexpected_tool_exception_fails_safely`. |
 | Bearer token or signing material ends up in logs | Only the verified `AgentIdentity` (not the raw token) is ever passed downstream from `get_verified_identity`. The raw token string never reaches `emit_audit_event` or any logger call. |
+| Egress audit leaks fetched content, credentials, or raw URLs | The closed hop schema records destination/address hashes, an allowlisted origin, decision/reason, and timing only. It has no field for body bytes, grant, certificate, key, cookie, or authorization header. |
 
 ### Denial of Service
 
-Out of scope for this slice (no rate limiting, no request size caps
-beyond Pydantic field constraints). Noted under Known limitations.
+The public API still has no rate limiting. Egress-specific resource exposure is
+bounded by a 2 KiB URL limit, five-second total deadline, three redirects,
+64 KiB response, identity content encoding, bounded protocol records, and
+Worker CPU/memory/PID/output/lifetime limits. Broker-service saturation and
+distributed denial of service remain out of scope.
 
 ### Elevation of Privilege
 
@@ -139,7 +162,14 @@ beyond Pydantic field constraints). Noted under Known limitations.
 | Approval-creation endpoint is called by the requesting agent itself (self-approval) | `POST /v1/approvals` requires a separate `X-Approver-Key` credential, distinct from any agent's delegated-identity token. This is a simplification; see Known limitations. |
 | Client sets its own approver identity on a grant (`granted_by`) to fabricate provenance | The request schema has no `granted_by` field at all (`extra="forbid"` rejects one if sent); the approver identity recorded is always `Settings.approver_identity`, from trusted server configuration. `test_create_approval_ignores_client_supplied_granted_by`. |
 | A valid grant is replayed or raced concurrently | The Launcher atomically claims its signed nonce before container creation; one process has one winner. `test_one_grant_has_exactly_one_concurrent_winner`. |
-| A Worker reaches the network, host, Docker socket, or prior invocation state | Every invocation is a new `--network none`, non-root, read-only container with no mounts or socket, a bounded tmpfs, dropped capabilities, no-new-privileges, and quotas. `scripts/verify_worker_hardening.py` exercises live network and cross-run-state controls. |
+| A Worker reaches the network, host, Docker socket, or prior invocation state | Every invocation is a new `--network none`, non-root, read-only container with no caller/host-path mounts, a bounded tmpfs, dropped capabilities, no-new-privileges, and quotas. A web invocation receives only the fixed broker-socket volume. `scripts/verify_worker_hardening.py` exercises live network and cross-run-state controls. |
+| Worker bypasses the broker to reach an origin directly | Every Worker remains `network_disabled=True`; a web Worker gets only the fixed read-only Unix-socket volume. The broker—not the Worker—owns DNS/TCP/TLS. Unit tests inspect the exact Docker create options and the live hardening script probes a direct IP connection. |
+| SSRF reaches loopback, RFC/private, link-local, multicast, metadata, reserved, or non-global IPv4/IPv6 | The broker validates every answer at connection time and rejects the entire set before its connector is called. IPv4-mapped IPv6 and explicit metadata addresses are normalized/blocked. Parameterized tests assert zero connector calls. |
+| An allowlisted hostname resolves to a deployment-local address that is globally classified | The broker also rejects every address in its server-owned IPv4/IPv6 denied-CIDR set. The Compose protected subnet is separate from the allowed fixture subnet and is denied after DNS but before connection; the protected listener observes zero connections. |
+| DNS rebinding changes the address after policy validation | There is no policy-time/connection-time second lookup: the broker resolves once immediately before connection, validates every answer, and passes the selected numeric socket address to the connector while retaining the original hostname only for TLS verification. |
+| An allowed URL redirects to a blocked target or loops indefinitely | Every `Location` begins a fresh canonicalization/origin/DNS/address/TLS decision. Blocked redirect targets observe zero connections; loops and more than three redirects are denied. |
+| Worker calls the broker with no, unknown, expired, wrong-role, or other-invocation credentials | TLS and certificate-profile checks run before grant/DNS processing. The exact certificate SAN must bind the request's Worker ID and signed action invocation. All negative credential cases assert zero resolver and connector calls. |
+| Oversized, slow, compressed, non-UTF-8, or disallowed-content response consumes unbounded resources | The raw connector enforces content length, streamed byte cap, identity encoding, and remaining total deadline; the broker independently checks bytes, media type, charset, and strict UTF-8. |
 
 ## Security assumptions
 
@@ -149,6 +179,10 @@ beyond Pydantic field constraints). Noted under Known limitations.
 - **The Gateway does hold a dedicated development execution-grant private
   key.** Compromise permits grants until that local key is rotated; the key is
   never placed in the Worker or Launcher.
+- **Development credentials are mounted by role, not by directory.** The
+  Gateway alone receives the execution-grant signer and the Launcher alone
+  receives the Worker CA key. OPA, broker, and both fixtures receive only their
+  own identity and required public trust material. The ingress receives none.
 - **`sub == agent_id` for every issued token.** The identity model treats
   these as the same value; an issuer minting tokens where they differ
   will have every such token rejected (`TokenSubjectMismatch`). See
@@ -169,10 +203,19 @@ beyond Pydantic field constraints). Noted under Known limitations.
   from the gateway container, over that network, and OPA's own
   `--authorization=basic` policy further restricts its HTTP API to
   exactly the gateway's decision query and a liveness check.
-- The gateway container itself is **not** network-egress-blocked the same
-  way: it is additionally attached to a normal bridge network so its
-  port can be published to the host. This is a known, documented
-  tradeoff, not an oversight; see Known limitations.
+- The Gateway is attached only to `internal: true` control and ingress
+  networks. A separate credential-free fixed-target ingress owns the host port
+  and normal bridge attachment; it has no access to OPA, Launcher, broker,
+  fixtures, credentials, or Docker.
+- **The egress broker is trusted enforcement code.** In Compose it is the only
+  enforcement component attached to the allowed and protected fixture
+  networks. The protected subnet is explicitly denied. The Worker has no IP
+  route to the broker or either origin and can reach only the broker's Unix
+  socket.
+- **The configured allowlist is maintained server-side.** The agent selects a
+  URL inside the `web.fetch_text` schema, but it cannot add an origin to the
+  signed or broker policy. A permitted service can still proxy or change its
+  content.
 - The host running the approval store is trusted to keep it in-memory
   and process-local; this is explicitly not a durability guarantee (see
   Known limitations).
@@ -200,16 +243,24 @@ Each is a candidate for the roadmap.
   short-lived fixture certificates provide mTLS and role-negative tests, but
   there is no automated enrollment, rotation, revocation, or hardware-backed
   key protection.
-- **The gateway container is not network-egress-blocked.** It is
-  attached to both `internal_net` and a normal bridge network
-  (`edge_net`), the latter solely so its port can be published to the
-  host for manual testing. `opa` does not have this exposure; it is
-  attached only to `internal_net` and has no published port at all. The
-  gateway's own code never constructs an outbound HTTP client except
-  `OPAHttpPolicyClient`, targeting only the configured `OPA_URL`, but
-  this is an application-level guarantee (verified by code review), not
-  a network-level one the way OPA's isolation is. See
-  `docs/architecture.md#docker-network-topology`.
+- **Allowed content is not trustworthy.** Destination and TLS controls do not
+  prevent prompt injection, malicious markup, or a permitted service acting as
+  a proxy. Milestone 5's hostile-output boundary is not implemented; callers
+  must treat `web.fetch_text` output as untrusted data.
+- **The broker and parsers are trusted and attackable.** TLS/HTTP/DNS parser
+  defects, IP/IDNA classification drift, broker traffic analysis, and broker
+  denial of service remain possible. The broker has process-local replay state,
+  not durable distributed state.
+- **The Launcher holds the Worker client-CA private key in this prototype** to
+  issue per-invocation credentials. Production enrollment, revocation, key
+  protection, and multi-host issuance are not implemented.
+- **The credential-free ingress retains normal bridge-network exposure.** It
+  exists because Docker Desktop did not provide host-published ingress for a
+  service attached only to an `internal: true` network. Its fixed proxy code
+  targets only `gateway:8000`, and network segmentation prevents it from
+  reaching OPA, Launcher, broker, or fixtures, but compromise of this minimal
+  process could still use its ordinary bridge route for denial of service or
+  unrelated outbound traffic. It holds no credentials or execution authority.
 - **OPA's read-only API hardening (`--authorization=basic`) governs the
   HTTP management API only.** It does not prevent someone with access to
   the host or the Compose file from editing the mounted policy files

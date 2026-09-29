@@ -179,7 +179,7 @@ corresponding automated test. To reproduce the full validation:
 
 ```bash
 pip install -e ".[dev]"
-pytest -v                                            # 59 tests, includes every required scenario below
+pytest -v                                            # 90 tests, includes every required scenario below
 ruff check src tests scripts && mypy src && bandit -r src -c pyproject.toml
 pip-audit                                             # dependency vulnerability scan
 docker run --rm -v "$(pwd)/policy:/policy" openpolicyagent/opa:0.70.0 test /policy -v

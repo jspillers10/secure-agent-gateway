@@ -1,0 +1,97 @@
+# Secure Agent Gateway: MCP proxy policy
+#
+# Rules are checked top to bottom and the first rule whose `name` glob
+# matches the tool wins. Tools that match no rule get `default`.
+#
+#   action: allow   forward the call
+#   action: ask     hold the call until a human runs `sag approve <id>`
+#   action: deny    block the call and hide the tool from tools/list
+#
+# deny_args / allow_args map an argument-name glob to a list of value
+# globs. deny_args blocks on any match (case-insensitive). allow_args
+# blocks anything that matches none of the listed globs (case-sensitive).
+# Try a call without running anything:
+#
+#   sag check -c sag-policy.yaml read_file --args '{"path": "/home/me/.env"}'
+
+version: 1
+
+# What to do with tools no rule mentions.
+default: ask
+
+# Block calls whose arguments contain credentials (AWS keys, private key
+# blocks, GitHub/Slack/OpenAI/Anthropic tokens, JWTs, ...). This is what
+# stops a hijacked agent from pasting a secret it already saw into a
+# network or write tool.
+secrets:
+  scan: true
+  action: deny
+
+# How long an approval stays usable after `sag approve`.
+approval_ttl_seconds: 600
+
+tools:
+  # Shell and code execution: never.
+  - name: "*shell*"
+    action: deny
+  - name: "*exec*"
+    action: deny
+  - name: "run_*"
+    action: deny
+
+  # Reads are fine, except for credential files. These names match
+  # @modelcontextprotocol/server-filesystem (read_file, read_text_file,
+  # read_multiple_files, ...) and most other file servers.
+  - name: "read_*"
+    action: allow
+    deny_args: &sensitive_paths
+      "*path*":
+        - "*.env"
+        - "*.env.*"
+        - "*/.ssh/*"
+        - "*/.aws/*"
+        - "*/.gnupg/*"
+        - "*/.kube/*"
+        - "*/.docker/config.json"
+        - "*.pem"
+        - "*.key"
+        - "*id_rsa*"
+        - "*id_ed25519*"
+        - "*.npmrc"
+        - "*.pypirc"
+        - "*.netrc"
+        - "*credentials*"
+  - name: "list_*"
+    action: allow
+  - name: "search_*"
+    action: allow
+    deny_args: *sensitive_paths
+  - name: "get_*"
+    action: allow
+    deny_args: *sensitive_paths
+  - name: "directory_tree"
+    action: allow
+
+  # Changes to disk need a human.
+  - name: "write_*"
+    action: ask
+    deny_args: *sensitive_paths
+  - name: "edit_*"
+    action: ask
+    deny_args: *sensitive_paths
+  - name: "move_*"
+    action: ask
+  - name: "create_*"
+    action: ask
+  - name: "delete_*"
+    action: ask
+
+  # Outbound requests: allow-list destinations you trust, ask for the rest.
+  # - name: "http_*"
+  #   action: allow
+  #   allow_args:
+  #     url: ["https://api.github.com/*"]
+  - name: "http_*"
+    action: ask
+  - name: "fetch*"
+    action: ask

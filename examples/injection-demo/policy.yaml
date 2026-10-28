@@ -1,0 +1,25 @@
+# Policy for the prompt-injection demo. See examples/injection-demo/README.md.
+version: 1
+
+# Anything not listed below is blocked and hidden from the agent.
+default: deny
+
+# Credentials never leave through a tool call, whatever the tool.
+secrets:
+  scan: true
+  action: deny
+
+tools:
+  - name: run_shell
+    action: deny
+
+  - name: read_file
+    action: allow
+    deny_args:
+      path: ["*.env", "*.env.*", "*/.ssh/*", "*/.aws/*", "*.pem", "*.key"]
+
+  # Outbound requests wait for a human. In real use, add an allow-list:
+  #   allow_args:
+  #     url: ["https://api.yourcompany.example/*"]
+  - name: http_post
+    action: ask

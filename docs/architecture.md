@@ -38,25 +38,25 @@ flowchart LR
 - **Identity verifier**: cryptographic and claim verification only. Never
   trusts unverified claims, and requires the JWT `sub` claim to equal
   `agent_id` (see [Identity model](#identity-model) below and
-  `src/gateway/identity/tokens.py`).
+  `src/secure_agent_gateway/identity/tokens.py`).
 - **Fixed tool registry**: the only place a tool name resolves to a
   schema, risk, scope, and artifact digest. A corresponding closed registry
   inside the Worker resolves the inert handler. No dynamic import and no
   `getattr` on client input
-  (`src/gateway/registry/tools.py`). This is one of *two* independent
+  (`src/secure_agent_gateway/registry/tools.py`). This is one of *two* independent
   sources of truth for what a tool costs; see
   [Who owns the policy mapping](#who-owns-the-policy-mapping) below.
 - **Approval store**: single-use records bound to (tool, argument hash,
   agent identity, delegated-user identity, expiration), with a
   non-consuming `validate()` and a separately-called atomic `consume()`
-  (`src/gateway/approvals/store.py`); see
+  (`src/secure_agent_gateway/approvals/store.py`); see
   [Two-phase approval flow](#two-phase-approval-flow).
 - **OPA**: the *only* component that renders allow/deny/approval-required,
   and the *only* place the tool -> required-scope/risk/approval-required
   mapping is decided from (the gateway sends a tool name, never a
   pre-resolved scope or risk). The gateway treats any failure to reach it,
   or any response that fails its closed schema, as a deny
-  (`src/gateway/policy/opa_client.py`, `policy/gateway/authz.rego`).
+  (`src/secure_agent_gateway/policy/opa_client.py`, `policy/gateway/authz.rego`).
 - **Registry ↔ policy metadata cross-check**: after OPA answers, the
   gateway compares OPA's `required_scope`/`risk`/`approval_required`
   metadata against its own registry entry for the same tool and fails
@@ -71,15 +71,15 @@ flowchart LR
   grant, executes one of the three inert fixtures, signs the result with a
   per-run key, and exits. It has no Docker SDK or socket.
 - **Mock tools**: pure, inert functions executed only inside the Worker. No
-  shell, no network, no real side effects (`src/gateway/tools_impl/`).
+  shell, no network, no real side effects (`src/secure_agent_gateway/tools_impl/`).
 - **Audit emitters**: two closed Pydantic schemas (`AuditEvent` for the
   tool-invocation lifecycle, `ApprovalAuditEvent` for the approval
   lifecycle) that structurally cannot carry raw arguments, tokens,
   approval ids, or approver credentials; only hashes and enum-like
-  status fields (`src/gateway/audit/log.py`). Separate redacted Launcher and
+  status fields (`src/secure_agent_gateway/audit/log.py`). Separate redacted Launcher and
   Worker lifecycle schemas record accepted/start/terminal provenance without
   arguments, credentials, grants, nonces, or raw results
-  (`src/gateway/execution/audit.py`).
+  (`src/secure_agent_gateway/execution/audit.py`).
 
 ## Identity model
 
@@ -88,14 +88,14 @@ value as the `agent_id` claim: the token authenticates the *agent*, and
 `delegated_user` is a separate, asserted (not cryptographically verified)
 claim naming the human the agent is acting for. `verify_delegated_token`
 requires `sub == agent_id` and rejects the token outright if they differ.
-See the full writeup in `src/gateway/identity/tokens.py`'s module
+See the full writeup in `src/secure_agent_gateway/identity/tokens.py`'s module
 docstring, and `TokenSubjectMismatch` /
 `tests/test_token_verification.py::test_sub_agent_id_mismatch_rejected`.
 
 RS256 is the only algorithm this gateway will ever accept, not just by
 default, but enforced: `load_settings()` rejects `JWT_ALGORITHM=HS256`,
 `none`, or any value other than `RS256` at startup, before the process
-serves any traffic (`src/gateway/config.py::SUPPORTED_JWT_ALGORITHMS`,
+serves any traffic (`src/secure_agent_gateway/config.py::SUPPORTED_JWT_ALGORITHMS`,
 `tests/test_config.py::test_load_settings_rejects_unsupported_jwt_algorithm`).
 
 ## Who owns the policy mapping
@@ -223,7 +223,7 @@ stranded as spent by a subsequent denial or outage, even though nothing
 was ever executed. It's also what makes a race between two callers
 presenting the same approval safe: both can validate as "the approval
 looks fine", but only one can win the atomic consume.
-See `src/gateway/approvals/store.py` and the regression tests in
+See `src/secure_agent_gateway/approvals/store.py` and the regression tests in
 `tests/test_approvals.py` (`test_approval_survives_policy_outage`,
 `test_approval_survives_policy_denial`,
 `test_approval_race_only_one_consumer_wins`,
@@ -235,11 +235,11 @@ invitation to retry, and is recorded in the audit trail with a distinct
 `approval_state`. The audit trail never records the approval id itself,
 the approver credential, or raw arguments; only tool name, identity,
 argument hash, and an event/reason (see `ApprovalAuditEvent` in
-`src/gateway/audit/log.py`).
+`src/secure_agent_gateway/audit/log.py`).
 
 ## Why the risk level can't be forged
 
-`ToolInvocationRequest` (`src/gateway/api/schemas.py`) has no `risk`
+`ToolInvocationRequest` (`src/secure_agent_gateway/api/schemas.py`) has no `risk`
 field and `extra="forbid"`. Risk is never client input, and, as of the
 OPA-owns-the-mapping correction, it isn't gateway-computed-and-sent
 either: OPA resolves it from its own `tools` data given only the tool
@@ -250,7 +250,7 @@ registry before trusting anything about the decision.
 
 Two independent components each hold their own copy of the tool -> scope/
 risk/approval-required mapping: the Python `TOOL_REGISTRY`
-(`src/gateway/registry/tools.py`) and OPA's `tools` data
+(`src/secure_agent_gateway/registry/tools.py`) and OPA's `tools` data
 (`policy/gateway/authz.rego`). The gateway never sends its copy to OPA;
 it sends only the tool *name*, so a bug or compromise in the gateway
 that caused it to construct a wrong policy input still can't make OPA

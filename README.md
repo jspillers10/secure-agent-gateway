@@ -1,12 +1,161 @@
 # Secure Agent Gateway
 
+A policy firewall for AI agent tool calls. Put `sag` between your MCP client
+(Claude Desktop, Claude Code, Cursor) and any stdio MCP server. Every tool
+call is checked against a YAML policy before it reaches the server, and is
+then allowed, blocked, or held until you approve it.
+
+The policy runs outside the model, so injected instructions cannot argue
+with it.
+
+## Quickstart
+
+```bash
+pip install "git+https://github.com/jspillers10/secure-agent-gateway"
+sag init        # writes ./sag-policy.yaml with safe defaults
+```
+
+Wrap a server in your Claude Desktop config
+(`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS,
+`%APPDATA%\Claude\claude_desktop_config.json` on Windows). This example
+puts the gateway in front of the official filesystem server:
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "sag",
+      "args": [
+        "mcp", "-c", "/Users/you/sag-policy.yaml", "--",
+        "npx", "-y", "@modelcontextprotocol/server-filesystem", "/Users/you/projects"
+      ]
+    }
+  }
+}
+```
+
+Restart Claude Desktop and ask Claude to read a `.env` file in that folder.
+The call is blocked before it reaches the server, and Claude is told why.
+
+If Claude Desktop cannot find `sag`, use the full path from `which sag`
+(macOS/Linux) or `where sag` (Windows). On Windows, write paths in the JSON
+with doubled backslashes (`C:\Users\you\projects`).
+
+Claude Code:
+
+```bash
+claude mcp add filesystem -- sag mcp -c ~/sag-policy.yaml -- \
+  npx -y @modelcontextprotocol/server-filesystem ~/projects
+```
+
+Cursor uses the same JSON shape as Claude Desktop, in `~/.cursor/mcp.json`.
+
+When a call is held for approval:
+
+```bash
+sag pending           # what is waiting, with credentials masked
+sag approve 3f9c0a1b2e
+```
+
+Then tell the agent to retry. The approval covers that exact call, once.
+
+## Demo
+
+A scripted agent reads a file containing a hidden prompt injection and tries
+to send your AWS keys to an attacker. First without the gateway, then with it:
+
+![sag blocking a prompt-injection exfiltration attempt](https://raw.githubusercontent.com/jspillers10/secure-agent-gateway/main/docs/assets/demo.gif)
+
+Without the gateway, the key is read and posted. With it, the `.env` read is
+blocked by a path rule, `run_shell` is hidden and blocked, and when the agent
+finds the key in a backup file no rule covers, the secret scan stops it at
+the `http_post`. Run it yourself:
+
+```bash
+pip install -e .
+python examples/injection-demo/agent.py
+python examples/injection-demo/agent.py --protected
+```
+
+Details in [examples/injection-demo/](examples/injection-demo/).
+
+## What the policy can do
+
+```yaml
+version: 1
+default: ask                      # for tools no rule matches
+secrets: {scan: true, action: deny}
+tools:
+  - name: "*shell*"               # glob over tool names; first match wins
+    action: deny                  # also hidden from tools/list
+  - name: "read_*"
+    action: allow
+    deny_args:
+      "*path*": ["*.env", "*/.ssh/*", "*.pem"]
+  - name: http_post
+    action: allow
+    allow_args:
+      url: ["https://api.github.com/*"]
+  - name: "write_*"
+    action: ask                   # held until `sag approve <id>`
+```
+
+- **allow / deny / ask** per tool, with glob tool names and a default.
+- **deny_args / allow_args** per argument. Deny rules also catch case,
+  `..`, backslash, and Windows trailing-dot variants. Allow rules are strict.
+- **Secret detection** in every argument: AWS keys, private key blocks,
+  GitHub, GitLab, Slack, OpenAI, Anthropic, Google, and Stripe tokens, and
+  JWTs. This is what stops a hijacked agent from pasting a credential it
+  already saw into an outbound call.
+- **Single-use approvals** bound to the tool and a hash of its exact
+  arguments. Changing one character needs a new approval.
+- **Redacted audit log** at `~/.sag/audit.jsonl`: decisions, rules, and
+  argument hashes. Raw argument values are never written.
+- **`sag check`** dry-runs a call against a policy, for testing policies in CI.
+
+Full reference, including evaluation order and the security model:
+[docs/mcp-proxy.md](docs/mcp-proxy.md).
+
+## Limits
+
+The proxy governs `tools/call` over stdio. It does not inspect tool results,
+it cannot recognize a secret the model has encoded first (base64, split
+across calls), and it trusts the upstream server to name its tools honestly.
+Approvals are only as strong as the separation between the agent and your
+terminal, so do not give the agent a shell. See
+[docs/mcp-proxy.md#security-model-and-limits](docs/mcp-proxy.md#security-model-and-limits).
+
+## Roadmap
+
+- Streamable HTTP transport, for remote MCP servers.
+- Route proxy decisions through the same OPA policy the reference
+  deployment uses, so one policy governs both.
+- Scan tool results before they reach the model.
+
+## Development
+
+```bash
+python -m venv .venv
+source .venv/bin/activate   # or .venv\Scripts\activate on Windows
+pip install -e ".[gateway,dev]"
+pytest
+ruff check src tests scripts examples && mypy src && bandit -r src -c pyproject.toml
+```
+
+## Hardened reference deployment
+
+The proxy is the quick way to protect an agent you already run. This
+repository started as a research reference for a stricter architecture:
+delegated identity, OPA policy, and per-call disposable workers. The
+original description follows.
+
 A security-engineering vertical slice demonstrating how AI agents can
 invoke tools through **delegated identity, least-privilege authorization,
 policy enforcement, approval controls, argument validation, and auditable
 execution.**
 
-This is not a chatbot and it does not embed an LLM. It is the enforcement
-layer an LLM-driven agent would sit behind: the boundary that decides,
+It is the enforcement layer an LLM-driven agent sits behind, with no model
+of its own: the boundary that decides,
 independent of anything the agent claims about itself, whether a
 requested tool call is allowed to happen at all.
 
@@ -15,9 +164,9 @@ requested tool call is allowed to happen at all.
 > ticket record with a random id. `admin.rotate_key` never contacts a key
 > management system and never rotates a real credential; it always
 > returns a simulated result. No tool performs shell execution, network
-> I/O, or file I/O. See [`src/gateway/tools_impl/`](src/gateway/tools_impl/).
+> I/O, or file I/O. See [`src/secure_agent_gateway/tools_impl/`](src/secure_agent_gateway/tools_impl/).
 
-## What this demonstrates
+### What this demonstrates
 
 `POST /v1/tool-invocations` is the one endpoint in this slice, and every
 request through it does all of the following, in order, failing closed at
@@ -27,13 +176,13 @@ every step:
    no algorithm-confusion attack works against it).
 2. Reject missing, expired, malformed, wrong-signature, or wrong-audience
    tokens.
-3. Resolve the requested tool through a **fixed, server-side registry**,
-   never a dynamic import, never client-named code.
+3. Resolve the requested tool through a **fixed, server-side registry**.
+   Tool code is never imported dynamically or named by the client.
 4. Validate arguments against a **tool-specific Pydantic schema** that
    rejects unknown fields.
 5. Non-consumingly validate any presented approval, then ask **Open
-   Policy Agent** (which owns the tool → required-scope/risk/approval
-   mapping itself, not the gateway) for a decision. The client cannot
+   Policy Agent** (which owns the mapping from tool to required scope,
+   risk, and approval) for a decision. The client cannot
    set or override the risk level; there is no field for it, and the
    gateway never even sends OPA a pre-resolved one.
 6. Cross-check OPA's answer against the gateway's own fixed tool registry
@@ -45,13 +194,13 @@ every step:
    create a fresh hardened Docker Worker, deliver one bounded stdin request,
    verify its per-run signed result, and destroy it.
 10. Emit one or more **redacted, structured audit events** per request:
-   hashes of arguments and results, never raw values, and never an
-   approval id or credential.
+   hashes of arguments and results only. Raw values, approval ids, and
+   credentials are never recorded.
 
 Full request/decision flow: [docs/architecture.md](docs/architecture.md).
 Full attacker-facing analysis: [docs/threat-model.md](docs/threat-model.md).
 
-## Architecture (summary)
+### Architecture (summary)
 
 ```mermaid
 flowchart LR
@@ -76,27 +225,27 @@ diagram, trust-boundary breakdown, the two-phase approval flow, the
 Docker network topology, and the specific mechanisms that prevent
 risk-level override and JWT algorithm confusion.
 
-## Local setup
+### Local setup
 
-Requires Python 3.11–3.13 and, for the full integration path, Docker
+Requires Python 3.11 to 3.13 and, for the full integration path, Docker
 Compose.
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate   # or .venv\Scripts\activate on Windows
-pip install -e ".[dev]"
+pip install -e ".[gateway,dev]"
 ```
 
-### Run the tests
+#### Run the tests
 
 ```bash
-pytest -v --cov=gateway --cov-report=term-missing
+pytest -v --cov=secure_agent_gateway --cov-report=term-missing
 ruff check src tests
 mypy src
 bandit -r src -c pyproject.toml
 ```
 
-### Run the Rego policy tests directly
+#### Run the Rego policy tests directly
 
 ```bash
 docker run --rm -v "$(pwd)/policy:/policy" openpolicyagent/opa:0.70.0 test /policy -v
@@ -105,7 +254,7 @@ docker run --rm -v "$(pwd)/policy:/policy" openpolicyagent/opa:0.70.0 test /poli
 (Or install the [`opa` CLI](https://www.openpolicyagent.org/docs/latest/cli/)
 locally and run `opa test policy/ -v`.)
 
-### Run the full stack with Docker Compose
+#### Run the full stack with Docker Compose
 
 ```bash
 python scripts/generate_dev_keys.py   # writes ./devkeys/, gitignored, never committed
@@ -126,7 +275,7 @@ egress. Disposable Workers have no network attachment at all; see
 for why, and `scripts/verify_opa_hardening.py` for how to still query it
 directly for debugging.
 
-### Manually exercise the API
+#### Manually exercise the API
 
 ```bash
 python scripts/generate_dev_keys.py
@@ -172,14 +321,14 @@ curl -s http://localhost:8088/v1/tool-invocations \
 # -> {"decision": "allow", "result": {"status": "simulated_rotation_recorded", ...}}
 ```
 
-## Reproduction: verifying the security claims
+### Reproduction: verifying the security claims
 
 Every claim in the [threat model](docs/threat-model.md) has a
 corresponding automated test. To reproduce the full validation:
 
 ```bash
-pip install -e ".[dev]"
-pytest -v                                            # 90 tests, includes every required scenario below
+pip install -e ".[gateway,dev]"
+pytest -v                                            # 176 tests, includes every required scenario below
 ruff check src tests scripts && mypy src && bandit -r src -c pyproject.toml
 pip-audit                                             # dependency vulnerability scan
 docker run --rm -v "$(pwd)/policy:/policy" openpolicyagent/opa:0.70.0 test /policy -v
@@ -234,13 +383,13 @@ Plus algorithm-confusion coverage
 configuration loading (`tests/test_config.py`), and approver-credential
 enforcement on `POST /v1/approvals` (`tests/test_approvals.py`).
 
-## Project layout
+### Project layout
 
 ```
-src/gateway/
+src/secure_agent_gateway/
   identity/     JWT verification -> AgentIdentity (RS256-only, sub==agent_id)
   registry/     fixed tool registry + per-tool argument schemas
-  risk.py       risk-level enum (values resolved by OPA, not this file)
+  risk.py       risk-level enum (values are resolved by OPA)
   policy/       OPA HTTP client (fail-closed on any error or schema mismatch)
   approvals/    single-use approval record store (validate, then atomic consume)
   audit/        redacted structured audit events (tool invocations + approvals)
@@ -249,15 +398,18 @@ src/gateway/
   worker/       one-shot isolated Worker protocol/runtime
   workload/     development workload-certificate validation
   tools_impl/   inert mock tool handlers
+  proxy/        MCP stdio proxy: YAML policy, secret scan, approvals, audit
+  cli.py        the `sag` command line
   api/          FastAPI routes, dependencies, request/response schemas
 policy/gateway/  Rego authorization policy (owns tool -> scope/risk/approval) + opa test suite
 policy/system/   OPA's own read-only management-API policy + opa test suite
 tests/           pytest suite (unit + API-level)
-scripts/         key generation, smoke/OPA/Worker checks, latency measurement
+scripts/         key generation, smoke/OPA/Worker checks, latency measurement, demo GIF
+examples/        prompt-injection demo for the MCP proxy
 docs/            architecture, threat model, research roadmap, Milestone-1 report
 ```
 
-## Security assumptions and known limitations
+### Security assumptions and known limitations
 
 Summarized in [docs/threat-model.md](docs/threat-model.md#security-assumptions)
 and [docs/threat-model.md](docs/threat-model.md#known-limitations). In short: the approval store
@@ -268,7 +420,7 @@ replay state is process-local, the Gateway retains edge-network egress, and
 the Launcher/Docker host boundary remains a high-value trust assumption. See
 [the Milestone-1 implementation report](docs/milestone-1-implementation.md).
 
-## Roadmap
+### Roadmap
 
 Beyond this vertical slice:
 

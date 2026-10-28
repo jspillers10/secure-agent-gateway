@@ -2,7 +2,7 @@
 
 Token-error precision is tested separately in test_token_verification.py;
 here the API is only expected to return a generic 401 for any bad token,
-by design (see src/gateway/api/deps.py).
+by design (see src/secure_agent_gateway/api/deps.py).
 """
 
 from __future__ import annotations
@@ -14,9 +14,9 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from gateway.api.deps import get_policy_client
-from gateway.policy.client import PolicyDecision
-from gateway.registry.tools import TOOL_REGISTRY
+from secure_agent_gateway.api.deps import get_policy_client
+from secure_agent_gateway.policy.client import PolicyDecision
+from secure_agent_gateway.registry.tools import TOOL_REGISTRY
 from tests.helpers.fake_policy import FakePolicyClient
 
 

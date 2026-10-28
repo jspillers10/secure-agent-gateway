@@ -6,10 +6,10 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from pydantic import ValidationError
 
-from gateway.execution.client import LauncherError, LauncherRequest
-from gateway.execution.local_launcher import InProcessLauncher
-from gateway.execution.protocol import ActionEnvelope, ApprovalBinding, ToolIdentity
-from gateway.execution.signing import (
+from secure_agent_gateway.execution.client import LauncherError, LauncherRequest
+from secure_agent_gateway.execution.local_launcher import InProcessLauncher
+from secure_agent_gateway.execution.protocol import ActionEnvelope, ApprovalBinding, ToolIdentity
+from secure_agent_gateway.execution.signing import (
     ExecutionGrantSigner,
     GrantVerificationError,
     ResultVerificationError,
@@ -19,8 +19,8 @@ from gateway.execution.signing import (
     verify_execution_grant,
     verify_tool_result,
 )
-from gateway.hashing import canonical_json_bytes, sha256_hex
-from gateway.registry.tools import WORKER_ARTIFACT_DIGEST
+from secure_agent_gateway.hashing import canonical_json_bytes, sha256_hex
+from secure_agent_gateway.registry.tools import WORKER_ARTIFACT_DIGEST
 from tests.helpers.keys import generate_rsa_keypair
 
 ISSUER = "secure-agent-gateway"
@@ -101,7 +101,7 @@ def test_cross_boundary_schemas_forbid_unknown_fields(model_name: str) -> None:
         payload = sign_tool_result(payload, result_key).model_dump(mode="json") | {
             "network": "host"
         }
-        from gateway.execution.protocol import ToolResultEnvelope
+        from secure_agent_gateway.execution.protocol import ToolResultEnvelope
 
         validator = ToolResultEnvelope.model_validate
     else:

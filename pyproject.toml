@@ -5,22 +5,48 @@ build-backend = "hatchling.build"
 [project]
 name = "secure-agent-gateway"
 version = "0.1.0"
-description = "A security-engineering vertical slice for delegated-identity, policy-enforced AI tool invocation."
+description = "Policy enforcement for AI agent tool calls: an MCP proxy plus a hardened delegated-identity reference gateway."
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
 license = { text = "MIT" }
 authors = [{ name = "Jake Spillers" }]
+keywords = ["mcp", "model-context-protocol", "ai-agents", "security", "policy", "llm"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+]
 
+# The MCP proxy (`sag`) needs only these. The reference gateway, Launcher,
+# and Worker need the [gateway] extra.
 dependencies = [
-    "fastapi==0.141.1",
     "pydantic==2.13.4",
-    "PyJWT==2.13.0",
+    "PyYAML==6.0.3",
+]
+
+[project.urls]
+Homepage = "https://github.com/jspillers10/secure-agent-gateway"
+Documentation = "https://github.com/jspillers10/secure-agent-gateway/blob/main/docs/mcp-proxy.md"
+Issues = "https://github.com/jspillers10/secure-agent-gateway/issues"
+
+[project.scripts]
+sag = "secure_agent_gateway.cli:main"
+
+[project.optional-dependencies]
+gateway = [
+    "fastapi==0.141.1",
+    "PyJWT==2.15.0",
     "cryptography==50.0.0",
     "httpx==0.28.1",
     "uvicorn[standard]==0.52.4",
 ]
-
-[project.optional-dependencies]
 launcher = [
     "docker==7.1.0",
 ]
@@ -33,11 +59,12 @@ dev = [
     "mypy==2.3.1",
     "bandit==1.9.4",
     "pip-audit==2.10.1",
-    "setuptools==84.0.0",
+    "setuptools==84.1.0",
+    "types-PyYAML==6.0.12.20260906",
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/gateway"]
+packages = ["src/secure_agent_gateway"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -9,6 +9,6 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY src ./src
-RUN pip install --no-cache-dir ".[launcher]"
+RUN pip install --no-cache-dir ".[gateway,launcher]"
 
-CMD ["uvicorn", "gateway.launcher.app:create_launcher_app", "--factory", "--host", "0.0.0.0", "--port", "8443", "--ssl-certfile", "/keys/launcher-cert.pem", "--ssl-keyfile", "/keys/launcher-key.pem", "--ssl-ca-certs", "/keys/gateway-client-ca-cert.pem", "--ssl-cert-reqs", "2"]
+CMD ["uvicorn", "secure_agent_gateway.launcher.app:create_launcher_app", "--factory", "--host", "0.0.0.0", "--port", "8443", "--ssl-certfile", "/keys/launcher-cert.pem", "--ssl-keyfile", "/keys/launcher-key.pem", "--ssl-ca-certs", "/keys/gateway-client-ca-cert.pem", "--ssl-cert-reqs", "2"]

@@ -1,10 +1,10 @@
-"""Unit tests for gateway.identity.tokens.verify_delegated_token.
+"""Unit tests for secure_agent_gateway.identity.tokens.verify_delegated_token.
 
 These call the verifier directly (not through the HTTP API) so each
 failure mode can be asserted precisely. The API layer intentionally
 collapses all of these into a single generic 401 to avoid acting as a
 validation oracle; see tests/test_tool_invocation.py and
-src/gateway/api/deps.py.
+src/secure_agent_gateway/api/deps.py.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ import time
 import jwt
 import pytest
 
-from gateway.identity.tokens import (
+from secure_agent_gateway.identity.tokens import (
     TokenClaimsInvalid,
     TokenExpired,
     TokenInvalidAudience,

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from gateway.config import ConfigurationError, load_settings
+from secure_agent_gateway.config import ConfigurationError, load_settings
 
 
 def _base_env(tmp_public_key_path: str | None = None) -> dict[str, str]:

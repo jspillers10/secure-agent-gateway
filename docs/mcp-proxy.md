@@ -149,7 +149,7 @@ model calls it again               -> held again (new request)
 An approval is bound to:
 
 - the tool name,
-- the SHA-256 of the canonical JSON of the arguments (`gateway.hashing.sha256_hex`,
+- the SHA-256 of the canonical JSON of the arguments (`secure_agent_gateway.hashing.sha256_hex`,
   the same function the reference gateway uses), and
 - the upstream server command.
 
@@ -185,7 +185,7 @@ Arguments are recorded only as `argument_hash`. The event schema is closed
 (`extra="forbid"`) and has no field that could hold a raw argument, tool
 result, or matched secret. Reasons are built from the policy text and
 argument names only. To check whether a particular call happened, hash its
-arguments with `gateway.hashing.sha256_hex` and search for the hash.
+arguments with `secure_agent_gateway.hashing.sha256_hex` and search for the hash.
 
 ## State directory
 

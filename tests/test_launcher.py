@@ -12,15 +12,15 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from gateway.execution.audit import LAUNCHER_AUDIT_LOGGER_NAME
-from gateway.execution.client import LauncherError, LauncherRequest
-from gateway.execution.protocol import ActionEnvelope, ApprovalBinding, ToolIdentity
-from gateway.execution.signing import ExecutionGrantSigner, sign_tool_result
-from gateway.hashing import sha256_hex
-from gateway.launcher.config import LauncherSettings
-from gateway.launcher.service import DockerExecutionLauncher
-from gateway.registry.tools import TOOL_REGISTRY, WORKER_ARTIFACT_DIGEST
-from gateway.worker.runtime import WorkerRequest, execute_worker_request
+from secure_agent_gateway.execution.audit import LAUNCHER_AUDIT_LOGGER_NAME
+from secure_agent_gateway.execution.client import LauncherError, LauncherRequest
+from secure_agent_gateway.execution.protocol import ActionEnvelope, ApprovalBinding, ToolIdentity
+from secure_agent_gateway.execution.signing import ExecutionGrantSigner, sign_tool_result
+from secure_agent_gateway.hashing import sha256_hex
+from secure_agent_gateway.launcher.config import LauncherSettings
+from secure_agent_gateway.launcher.service import DockerExecutionLauncher
+from secure_agent_gateway.registry.tools import TOOL_REGISTRY, WORKER_ARTIFACT_DIGEST
+from secure_agent_gateway.worker.runtime import WorkerRequest, execute_worker_request
 from tests.helpers.keys import generate_rsa_keypair
 
 
@@ -208,7 +208,7 @@ def test_launcher_owns_hardened_runtime_configuration_and_returns_fixture_result
     }
     options = docker.containers.calls[0]
     assert options["image"].startswith("sha256:")
-    assert options["entrypoint"] == ["python", "-m", "gateway.worker.main"]
+    assert options["entrypoint"] == ["python", "-m", "secure_agent_gateway.worker.main"]
     assert options["network_disabled"] is True
     assert options["user"] == "10001:10001"
     assert options["read_only"] is True

@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from gateway.proxy.policy import Policy, PolicyError, evaluate, is_listed, load_policy
-from gateway.proxy.secret_scan import find_secrets, redact
+from secure_agent_gateway.proxy.policy import Policy, PolicyError, evaluate, is_listed, load_policy
+from secure_agent_gateway.proxy.secret_scan import find_secrets, redact
 
 FAKE_AWS_KEY = "AKIAIOSFODNN7EXAMPLE"  # AWS's documented example key
 
@@ -265,7 +265,7 @@ def test_starter_policy_loads_and_blocks_the_obvious(tmp_path: Path) -> None:
     from importlib.resources import files
 
     path = tmp_path / "p.yaml"
-    path.write_text(files("gateway.proxy").joinpath("starter_policy.yaml").read_text())
+    path.write_text(files("secure_agent_gateway.proxy").joinpath("starter_policy.yaml").read_text())
     policy = load_policy(path)
     assert evaluate(policy, "read_text_file", {"path": "/proj/src/app.py"}).action == "allow"
     assert evaluate(policy, "read_text_file", {"path": "/proj/.env"}).action == "deny"

@@ -3,7 +3,7 @@
 Approval records are single-use and bound to (tool, argument hash, agent
 identity, delegated-user identity). Each mismatch dimension is tested
 independently, plus the two-phase validate-then-consume sequence that
-prevents premature consumption (see src/gateway/approvals/store.py).
+prevents premature consumption (see src/secure_agent_gateway/approvals/store.py).
 """
 
 from __future__ import annotations
@@ -15,11 +15,11 @@ from datetime import UTC, datetime, timedelta
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from gateway.api.deps import get_policy_client
-from gateway.approvals.store import ApprovalOutcome, ApprovalRecord, ApprovalStore
-from gateway.hashing import sha256_hex
-from gateway.policy.client import PolicyDecision
-from gateway.registry.schemas import AdminRotateKeyArgs
+from secure_agent_gateway.api.deps import get_policy_client
+from secure_agent_gateway.approvals.store import ApprovalOutcome, ApprovalRecord, ApprovalStore
+from secure_agent_gateway.hashing import sha256_hex
+from secure_agent_gateway.policy.client import PolicyDecision
+from secure_agent_gateway.registry.schemas import AdminRotateKeyArgs
 from tests.helpers.fake_policy import FakePolicyClient
 
 
@@ -146,7 +146,7 @@ def test_approval_survives_policy_outage(
 ) -> None:
     """A policy-engine outage must not burn the approval: validation
     happens before OPA is asked, and consumption happens only after OPA
-    says allow. See src/gateway/approvals/store.py."""
+    says allow. See src/secure_agent_gateway/approvals/store.py."""
     record = _grant_approval(approval_store)
     token = make_token(scopes=["admin.rotate_key"])
     body = {

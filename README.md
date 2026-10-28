@@ -64,7 +64,7 @@ Then tell the agent to retry. The approval covers that exact call, once.
 A scripted agent reads a file containing a hidden prompt injection and tries
 to send your AWS keys to an attacker. First without the gateway, then with it:
 
-![sag blocking a prompt-injection exfiltration attempt](docs/assets/demo.gif)
+![sag blocking a prompt-injection exfiltration attempt](https://raw.githubusercontent.com/jspillers10/secure-agent-gateway/main/docs/assets/demo.gif)
 
 Without the gateway, the key is read and posted. With it, the `.env` read is
 blocked by a path rule, `run_shell` is hidden and blocked, and when the agent
@@ -137,7 +137,7 @@ terminal, so do not give the agent a shell. See
 ```bash
 python -m venv .venv
 source .venv/bin/activate   # or .venv\Scripts\activate on Windows
-pip install -e ".[dev]"
+pip install -e ".[gateway,dev]"
 pytest
 ruff check src tests scripts examples && mypy src && bandit -r src -c pyproject.toml
 ```
@@ -154,8 +154,8 @@ invoke tools through **delegated identity, least-privilege authorization,
 policy enforcement, approval controls, argument validation, and auditable
 execution.**
 
-This is not a chatbot and it does not embed an LLM. It is the enforcement
-layer an LLM-driven agent would sit behind: the boundary that decides,
+It is the enforcement layer an LLM-driven agent sits behind, with no model
+of its own: the boundary that decides,
 independent of anything the agent claims about itself, whether a
 requested tool call is allowed to happen at all.
 
@@ -164,7 +164,7 @@ requested tool call is allowed to happen at all.
 > ticket record with a random id. `admin.rotate_key` never contacts a key
 > management system and never rotates a real credential; it always
 > returns a simulated result. No tool performs shell execution, network
-> I/O, or file I/O. See [`src/gateway/tools_impl/`](src/gateway/tools_impl/).
+> I/O, or file I/O. See [`src/secure_agent_gateway/tools_impl/`](src/secure_agent_gateway/tools_impl/).
 
 ### What this demonstrates
 
@@ -176,13 +176,13 @@ every step:
    no algorithm-confusion attack works against it).
 2. Reject missing, expired, malformed, wrong-signature, or wrong-audience
    tokens.
-3. Resolve the requested tool through a **fixed, server-side registry**,
-   never a dynamic import, never client-named code.
+3. Resolve the requested tool through a **fixed, server-side registry**.
+   Tool code is never imported dynamically or named by the client.
 4. Validate arguments against a **tool-specific Pydantic schema** that
    rejects unknown fields.
 5. Non-consumingly validate any presented approval, then ask **Open
-   Policy Agent** (which owns the tool → required-scope/risk/approval
-   mapping itself, not the gateway) for a decision. The client cannot
+   Policy Agent** (which owns the mapping from tool to required scope,
+   risk, and approval) for a decision. The client cannot
    set or override the risk level; there is no field for it, and the
    gateway never even sends OPA a pre-resolved one.
 6. Cross-check OPA's answer against the gateway's own fixed tool registry
@@ -194,8 +194,8 @@ every step:
    create a fresh hardened Docker Worker, deliver one bounded stdin request,
    verify its per-run signed result, and destroy it.
 10. Emit one or more **redacted, structured audit events** per request:
-   hashes of arguments and results, never raw values, and never an
-   approval id or credential.
+   hashes of arguments and results only. Raw values, approval ids, and
+   credentials are never recorded.
 
 Full request/decision flow: [docs/architecture.md](docs/architecture.md).
 Full attacker-facing analysis: [docs/threat-model.md](docs/threat-model.md).
@@ -227,19 +227,19 @@ risk-level override and JWT algorithm confusion.
 
 ### Local setup
 
-Requires Python 3.11–3.13 and, for the full integration path, Docker
+Requires Python 3.11 to 3.13 and, for the full integration path, Docker
 Compose.
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate   # or .venv\Scripts\activate on Windows
-pip install -e ".[dev]"
+pip install -e ".[gateway,dev]"
 ```
 
 #### Run the tests
 
 ```bash
-pytest -v --cov=gateway --cov-report=term-missing
+pytest -v --cov=secure_agent_gateway --cov-report=term-missing
 ruff check src tests
 mypy src
 bandit -r src -c pyproject.toml
@@ -327,8 +327,8 @@ Every claim in the [threat model](docs/threat-model.md) has a
 corresponding automated test. To reproduce the full validation:
 
 ```bash
-pip install -e ".[dev]"
-pytest -v                                            # 90 tests, includes every required scenario below
+pip install -e ".[gateway,dev]"
+pytest -v                                            # 176 tests, includes every required scenario below
 ruff check src tests scripts && mypy src && bandit -r src -c pyproject.toml
 pip-audit                                             # dependency vulnerability scan
 docker run --rm -v "$(pwd)/policy:/policy" openpolicyagent/opa:0.70.0 test /policy -v
@@ -386,10 +386,10 @@ enforcement on `POST /v1/approvals` (`tests/test_approvals.py`).
 ### Project layout
 
 ```
-src/gateway/
+src/secure_agent_gateway/
   identity/     JWT verification -> AgentIdentity (RS256-only, sub==agent_id)
   registry/     fixed tool registry + per-tool argument schemas
-  risk.py       risk-level enum (values resolved by OPA, not this file)
+  risk.py       risk-level enum (values are resolved by OPA)
   policy/       OPA HTTP client (fail-closed on any error or schema mismatch)
   approvals/    single-use approval record store (validate, then atomic consume)
   audit/        redacted structured audit events (tool invocations + approvals)
@@ -398,11 +398,14 @@ src/gateway/
   worker/       one-shot isolated Worker protocol/runtime
   workload/     development workload-certificate validation
   tools_impl/   inert mock tool handlers
+  proxy/        MCP stdio proxy: YAML policy, secret scan, approvals, audit
+  cli.py        the `sag` command line
   api/          FastAPI routes, dependencies, request/response schemas
 policy/gateway/  Rego authorization policy (owns tool -> scope/risk/approval) + opa test suite
 policy/system/   OPA's own read-only management-API policy + opa test suite
 tests/           pytest suite (unit + API-level)
-scripts/         key generation, smoke/OPA/Worker checks, latency measurement
+scripts/         key generation, smoke/OPA/Worker checks, latency measurement, demo GIF
+examples/        prompt-injection demo for the MCP proxy
 docs/            architecture, threat model, research roadmap, Milestone-1 report
 ```
 

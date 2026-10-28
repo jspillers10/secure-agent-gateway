@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from gateway.policy.client import PolicyDecision, PolicyError
+from secure_agent_gateway.policy.client import PolicyDecision, PolicyError
 
 TOOLS: dict[str, dict[str, Any]] = {
     "documents.read": {"required_scope": "documents.read", "risk": "low", "approval_required": False},

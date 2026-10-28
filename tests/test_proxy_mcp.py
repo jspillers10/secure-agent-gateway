@@ -13,11 +13,11 @@ from typing import Any
 
 import pytest
 
-from gateway.hashing import sha256_hex
-from gateway.proxy.approvals import ApprovalError, FileApprovalStore
-from gateway.proxy.audit import JsonlAuditLog
-from gateway.proxy.mcp import McpProxy
-from gateway.proxy.policy import Policy
+from secure_agent_gateway.hashing import sha256_hex
+from secure_agent_gateway.proxy.approvals import ApprovalError, FileApprovalStore
+from secure_agent_gateway.proxy.audit import JsonlAuditLog
+from secure_agent_gateway.proxy.mcp import McpProxy
+from secure_agent_gateway.proxy.policy import Policy
 
 FAKE_AWS_KEY = "AKIAIOSFODNN7EXAMPLE"
 FAKE_SERVER = Path(__file__).parent / "helpers" / "fake_mcp_server.py"
@@ -360,7 +360,7 @@ def _run_session(tmp_path: Path, messages: list[dict[str, Any]]) -> tuple[list[A
     env = {**os.environ, "FAKE_MCP_CALL_LOG": str(call_log), "SAG_HOME": str(tmp_path / "state")}
     stdin = "".join(json.dumps(m) + "\n" for m in messages)
     proc = subprocess.run(  # noqa: S603
-        [sys.executable, "-m", "gateway.cli", "mcp", "-c", str(policy), "--",
+        [sys.executable, "-m", "secure_agent_gateway.cli", "mcp", "-c", str(policy), "--",
          sys.executable, str(FAKE_SERVER)],
         input=stdin.encode(), capture_output=True, env=env, timeout=30, check=False,
     )
@@ -413,7 +413,7 @@ def test_end_to_end_approval_via_cli(tmp_path: Path) -> None:
 
     env = {**os.environ, "SAG_HOME": str(tmp_path / "state")}
     approve = subprocess.run(  # noqa: S603
-        [sys.executable, "-m", "gateway.cli", "approve", approval_id],
+        [sys.executable, "-m", "secure_agent_gateway.cli", "approve", approval_id],
         capture_output=True, env=env, timeout=30, check=False,
     )
     assert approve.returncode == 0, approve.stderr.decode()

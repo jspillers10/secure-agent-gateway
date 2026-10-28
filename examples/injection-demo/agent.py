@@ -97,8 +97,8 @@ def main() -> int:
     server = [sys.executable, str(HERE / "fake_server.py")]
     if args.protected:
         state = tempfile.mkdtemp(prefix="sag-demo-")
-        argv = [sys.executable, "-m", "gateway.cli", "mcp", "-c", str(HERE / "policy.yaml"),
-                "--state-dir", state, "--", *server]
+        argv = [sys.executable, "-m", "secure_agent_gateway.cli", "mcp",
+                "-c", str(HERE / "policy.yaml"), "--state-dir", state, "--", *server]
         print(style("# agent -> sag mcp -c policy.yaml -> MCP server", "2"))
     else:
         argv = server

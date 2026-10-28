@@ -9,11 +9,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY src ./src
-RUN pip install --no-cache-dir . \
+RUN pip install --no-cache-dir ".[gateway]" \
     && useradd --no-create-home --uid 10001 --shell /usr/sbin/nologin worker
 
 LABEL org.secure-agent.role="disposable-worker" \
       org.secure-agent.artifact-digest="sha256:33a885ff194feb4aa5310767de9b08ffd31495f1923dc81c0c63dd19d0fe288b"
 
 USER 10001:10001
-ENTRYPOINT ["python", "-m", "gateway.worker.main"]
+ENTRYPOINT ["python", "-m", "secure_agent_gateway.worker.main"]

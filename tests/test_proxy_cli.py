@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from gateway.cli import main
-from gateway.proxy.approvals import FileApprovalStore
+from secure_agent_gateway.cli import main
+from secure_agent_gateway.proxy.approvals import FileApprovalStore
 
 
 def test_init_writes_starter_policy_and_refuses_overwrite(tmp_path: Path) -> None:

@@ -1,0 +1,73 @@
+name: Release
+
+# Publishes to PyPI when a version tag (v0.2.0, v1.0.0rc1, ...) is pushed.
+# Uses PyPI trusted publishing (OIDC), so no API token is stored anywhere.
+#
+# One-time setup before the first release:
+#   1. On PyPI, add a pending trusted publisher for project
+#      "secure-agent-gateway": owner jspillers10, repository
+#      secure-agent-gateway, workflow release.yml, environment pypi.
+#   2. In this repository, create an environment named "pypi" (Settings ->
+#      Environments). Adding required reviewers there gives a manual
+#      approval step before anything is uploaded.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build distributions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Check the tag matches the project version
+        run: |
+          version=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match pyproject version ${version}"; exit 1
+          fi
+
+      - name: Build sdist and wheel
+        run: |
+          pip install build==1.6.1 twine==7.0.0
+          python -m build
+          twine check --strict dist/*
+
+      - name: Smoke-test the wheel in a clean environment
+        run: |
+          python -m venv /tmp/wheel-env
+          /tmp/wheel-env/bin/pip install dist/*.whl
+          /tmp/wheel-env/bin/sag init /tmp/policy.yaml
+          /tmp/wheel-env/bin/sag check -c /tmp/policy.yaml read_file --args '{"path": "README.md"}'
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/secure-agent-gateway
+    permissions:
+      id-token: write # required for trusted publishing; nothing else is granted
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2

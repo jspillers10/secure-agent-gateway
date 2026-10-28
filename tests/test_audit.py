@@ -10,10 +10,10 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from gateway.approvals.store import ApprovalStore
-from gateway.audit.log import AUDIT_LOGGER_NAME
-from gateway.hashing import sha256_hex
-from gateway.registry.schemas import AdminRotateKeyArgs
+from secure_agent_gateway.approvals.store import ApprovalStore
+from secure_agent_gateway.audit.log import AUDIT_LOGGER_NAME
+from secure_agent_gateway.hashing import sha256_hex
+from secure_agent_gateway.registry.schemas import AdminRotateKeyArgs
 
 
 def _auth(token: str) -> dict[str, str]:

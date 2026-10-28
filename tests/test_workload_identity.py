@@ -7,7 +7,10 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.x509.oid import ExtendedKeyUsageOID
 from scripts.generate_dev_keys import _create_ca, _create_leaf
 
-from gateway.workload.certificates import WorkloadCertificateError, verify_workload_certificate
+from secure_agent_gateway.workload.certificates import (
+    WorkloadCertificateError,
+    verify_workload_certificate,
+)
 
 
 def _pem(certificate: object) -> str:
